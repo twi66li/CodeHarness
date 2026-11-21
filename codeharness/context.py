@@ -25,7 +25,7 @@ class Context:
             for path in sorted(root.glob("*/SKILL.md")):
                 if not path.resolve().is_relative_to(root.resolve()):
                     continue
-                text = path.read_text(encoding="utf-8")
+                text = path.read_text(encoding="utf-8-sig")
                 lines = text.splitlines()
                 metadata = {}
                 if lines and lines[0] == "---":
@@ -42,7 +42,10 @@ class Context:
         result = SYSTEM
         rules = self.workspace / "AGENTS.md"
         if rules.is_file() and rules.resolve().is_relative_to(self.workspace.resolve()):
-            result += "\n\n项目规则：\n" + rules.read_text(encoding="utf-8")[:10000]
+            text = rules.read_text(encoding="utf-8-sig")
+            if len(text) > 10000:
+                text = text[:10000] + "\n...[AGENTS.md 已截断至 10000 字符]"
+            result += "\n\n项目规则：\n" + text
         if self.skills:
             result += "\n\n可用 Skills（按需调用 load_skill）：\n" + "\n".join(
                 f"- {name}: {skill['description']}" for name, skill in self.skills.items())
@@ -53,7 +56,7 @@ class Context:
     def load_skill(self, name: str) -> dict:
         if name not in self.skills:
             raise ValueError(f"Skill 不存在：{name}")
-        text = self.skills[name]["path"].read_text(encoding="utf-8")
+        text = self.skills[name]["path"].read_text(encoding="utf-8-sig")
         if len(text) > 16000:
             raise ValueError("Skill 超过 16000 字符，请缩短后再加载")
         return {"name": name, "instructions": text}
@@ -63,7 +66,7 @@ class Context:
             return copy.deepcopy(messages), False
         # Preserve every user instruction and the last two assistant/tool groups.
         starts = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
-        boundary = starts[-2] if len(starts) > 2 else 1
+        boundary = starts[-2] if len(starts) > 2 else 0
         kept, summaries = [], []
         for index, message in enumerate(messages):
             if index >= boundary or message["role"] in {"system", "user"}:
@@ -73,7 +76,38 @@ class Context:
                 summaries.append("assistant: " + (", ".join(calls) or str(message.get("content", ""))[:240]))
             elif message["role"] == "tool":
                 summaries.append("tool: " + message["content"][:500])
+        compacted = False
         if summaries:
-            kept.insert(1, {"role": "system", "content":
-                "较早执行记录摘要（完整输出仍保存在会话日志及 artifact 中）：\n" + "\n".join(summaries)[-6000:]})
-        return kept, True
+            summary_block = ("较早执行记录摘要（完整输出仍保存在会话日志及 artifact 中）：\n"
+                             + "\n".join(summaries)[-6000:])
+            if kept and kept[0]["role"] == "system":
+                kept[0]["content"] += "\n\n" + summary_block
+            else:
+                kept.insert(0, {"role": "system", "content": summary_block})
+            compacted = True
+        if len(json.dumps(kept, ensure_ascii=False)) > self.max_chars:
+            for index in range(len(kept) - 1):
+                message = kept[index]
+                if message["role"] != "tool" or len(message["content"]) <= 800:
+                    continue
+                try:
+                    payload = json.loads(message["content"])
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict):
+                    trimmed = {"ok": payload.get("ok", True), "truncated": True}
+                    if "artifact_id" in payload:
+                        trimmed["artifact_id"] = payload["artifact_id"]
+                    if "error" in payload:
+                        trimmed["error"] = str(payload["error"])[:400]
+                    elif "preview" in payload:
+                        trimmed["preview"] = str(payload["preview"])[:400]
+                    elif "output" in payload:
+                        trimmed["preview"] = json.dumps(payload["output"], ensure_ascii=False)[:400]
+                    message["content"] = json.dumps(trimmed, ensure_ascii=False)
+                else:
+                    message["content"] = message["content"][:800]
+                compacted = True
+                if len(json.dumps(kept, ensure_ascii=False)) <= self.max_chars:
+                    break
+        return kept, compacted

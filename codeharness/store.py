@@ -106,6 +106,7 @@ class Store:
         events = self.events(sid)
         answered = {e["data"]["tool_call_id"] for e in events
                     if e["kind"] == "message" and e["data"]["role"] == "tool"}
+        started = {e["data"]["call_id"] for e in events if e["kind"] == "tool_started"}
         finished = {e["data"]["call_id"]: e["data"]["result"] for e in events if e["kind"] == "tool_finished"}
         for event in events:
             if event["kind"] != "message":
@@ -114,9 +115,15 @@ class Store:
                 cid = call["id"]
                 if cid in answered:
                     continue
-                result = finished.get(cid, {"ok": False, "error":
-                    "执行被中断，工具是否产生副作用尚不确定。先检查文件或测试状态，不要直接重复写操作。"})
+                if cid in finished:
+                    result = finished[cid]
+                elif cid in started:
+                    result = {"ok": False, "error":
+                        "执行被中断，工具是否产生副作用尚不确定。先检查文件或测试状态，不要直接重复写操作。"}
+                else:
+                    result = {"ok": False, "error": "前序调用中断，本工具调用尚未执行。"}
                 self.append(sid, "message", {"role": "tool", "tool_call_id": cid,
                                            "content": json.dumps(result, ensure_ascii=False)})
-                self.append(sid, "tool_reconciled", {"call_id": cid, "completed": cid in finished})
+                self.append(sid, "tool_reconciled", {"call_id": cid, "completed": cid in finished,
+                                                     "started": cid in started})
                 answered.add(cid)
