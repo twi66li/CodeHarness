@@ -31,19 +31,22 @@ def create_demo(path: Path):
 class DemoModel:
     name = "offline-demo"
 
-    def complete(self, messages: list[dict], tools: list[dict], max_tokens: int) -> Reply:
+    def complete(self, messages: list[dict], tools: list[dict], max_tokens: int,
+                 *, timeout: float | None = None) -> Reply:
         available = {tool["function"]["name"] for tool in tools}
         outputs = []
         for message in messages:
             if message["role"] == "tool":
                 outputs.append(json.loads(message["content"]))
-        if "delegate" not in available:
+        if "write_file" not in available:
             if not outputs:
                 return self.call("read_file", {"path": "basket.py"})
             return self.text("basket.py 的 total 将百分比折扣直接相减；应对总价乘以 (1 - discount)。")
         calls = [call["function"]["name"] for m in messages for call in m.get("tool_calls", [])]
         if not calls:
-            return self.call("delegate", {"task": "只读检查 basket.py，指出折扣计算问题并给出文件依据。"})
+            if "delegate" in available:
+                return self.call("delegate", {"task": "只读检查 basket.py，指出折扣计算问题并给出文件依据。"})
+            return self.call("read_file", {"path": "basket.py"})
         if calls[-1] == "delegate":
             return self.call("read_file", {"path": "basket.py"})
         if calls[-1] == "read_file":

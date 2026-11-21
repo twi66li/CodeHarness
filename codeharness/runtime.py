@@ -21,9 +21,10 @@ class Limits:
     output_tokens: int = 2048
     context_chars: int = 28000
     max_seconds: int = 600
+    model_attempts: int = 3
 
     def __post_init__(self):
-        if min(self.max_requests, self.max_tokens, self.output_tokens, self.max_seconds) < 1:
+        if min(self.max_requests, self.max_tokens, self.output_tokens, self.max_seconds, self.model_attempts) < 1:
             raise ValueError("预算和超时必须大于 0")
         if self.context_chars < 2000:
             raise ValueError("上下文字符预算不能小于 2000")
@@ -42,7 +43,7 @@ class Result:
 class Agent:
     def __init__(self, model: Model, workspace: Path, store: Store, policy: Policy | None = None,
                  limits: Limits | None = None, plugins: list[Path] | None = None,
-                 observe: Callable | None = None):
+                 observe: Callable | None = None, enable_delegate: bool = True):
         self.model = model
         self.workspace = Workspace(workspace)
         self.store = store
@@ -50,18 +51,20 @@ class Agent:
         self.limits = limits or Limits()
         self.plugins = plugins or []
         self.observe = observe or (lambda kind, data: None)
+        self.enable_delegate = enable_delegate
+        self._model_access_error = None
 
     def _registry(self, sid: str, context: Context, readonly: bool, deadline: float) -> Registry:
         policy = Policy(readonly=True) if readonly else self.policy
         registry = Registry(self.workspace, policy)
-        register_workspace_tools(registry)
+        register_workspace_tools(registry, deadline=deadline)
         if readonly:
             registry.tools = {name: tool for name, tool in registry.tools.items() if tool.effect == "read"}
 
         def load_skill(name):
             result = context.load_skill(name)
             self.store.append(sid, "skill_loaded", result)
-            return result
+            return {"name": result["name"], "loaded": True, "chars": len(result["instructions"])}
 
         def read_artifact(artifact_id, offset=0, chars=4000):
             if offset < 0 or not 1 <= chars <= 6000:
@@ -77,13 +80,14 @@ class Agent:
             "chars": integer("读取字符数，默认 4000，上限 6000")}, ["artifact_id"]), read_artifact))
 
         if not readonly:
-            def delegate(task):
-                child = self.run(task, parent_id=sid, readonly=True, deadline=deadline)
-                return {"session_id": child.session_id, "status": child.status,
-                        "summary": child.answer[:6000], "usage": child.usage}
+            if self.enable_delegate:
+                def delegate(task):
+                    child = self.run(task, parent_id=sid, readonly=True, deadline=deadline)
+                    return {"session_id": child.session_id, "status": child.status,
+                            "summary": child.answer[:6000], "usage": child.usage}
 
-            registry.register(Tool("delegate", "委派只读代码探索；独立上下文，共享总预算，最多 6 次模型请求。", parameters({
-                "task": string("明确的调查目标与需要返回的证据")}, ["task"]), delegate, "delegate"))
+                registry.register(Tool("delegate", "委派只读代码探索；独立上下文，共享总预算，最多 6 次模型请求。", parameters({
+                    "task": string("明确的调查目标与需要返回的证据")}, ["task"]), delegate, "delegate"))
             for index, path in enumerate(self.plugins):
                 spec = importlib.util.spec_from_file_location(f"codeharness_extension_{index}", path)
                 if not spec or not spec.loader:
@@ -97,9 +101,11 @@ class Agent:
             readonly: bool = False, deadline: float | None = None) -> Result:
         if not task.strip():
             raise ValueError("任务不能为空")
+        if parent_id is None:
+            self._model_access_error = None
         deadline = deadline or time.monotonic() + self.limits.max_seconds
         context = Context(self.workspace.root, self.limits.context_chars)
-        snapshot = self.workspace.snapshot()
+        snapshot = self.workspace.snapshot(use_cache=False)
         if session_id:
             session = self.store.session(session_id)
             if Path(session["workspace"]).resolve() != self.workspace.root:
@@ -107,8 +113,10 @@ class Agent:
             readonly = bool(session["parent_id"])
             sid = session_id
             self.store.repair_pending(sid)
-            checkpoints = [e["data"] for e in self.store.events(sid) if e["kind"] == "checkpoint"]
-            previous = checkpoints[-1]["files"] if checkpoints else snapshot
+            events = self.store.events(sid)
+            checkpoints = [e["data"] for e in events if e["kind"] == "checkpoint"]
+            baselines = [e["data"] for e in events if e["kind"] == "baseline"]
+            previous = checkpoints[-1]["files"] if checkpoints else (baselines[0]["files"] if baselines else snapshot)
             changed = sorted(p for p in previous.keys() | snapshot.keys() if previous.get(p) != snapshot.get(p))
             if changed:
                 self.store.append(sid, "message", {"role": "user", "content":
@@ -126,7 +134,11 @@ class Agent:
         try:
             registry = self._registry(sid, context, readonly, deadline)
             local_requests = 0
+            failed_attempts = 0
             while True:
+                if self._model_access_error:
+                    status, answer = "error", self._model_access_error
+                    break
                 usage = self.store.usage(sid)
                 if usage["requests"] >= self.limits.max_requests or (readonly and local_requests >= 6):
                     break
@@ -143,30 +155,76 @@ class Agent:
                 schemas = registry.schemas()
                 estimated_input = len(json.dumps([prepared, schemas], ensure_ascii=False)) // 3 + 1
                 remaining = self.limits.max_tokens - usage["input_tokens"] - usage["output_tokens"] - estimated_input
-                if remaining <= 0:
+                min_output = min(256, self.limits.output_tokens)
+                if remaining < min_output:
                     break
                 output_tokens = min(self.limits.output_tokens, remaining)
                 if compacted:
                     self.store.append(sid, "context_compacted", {"original_messages": len(messages),
                         "sent_messages": len(prepared), "strategy": "keep_user_constraints_and_recent_turns"})
-                # Persist the exact input before sending it; no credentials are included.
+                seconds_left = deadline - time.monotonic()
+                if seconds_left <= 0:
+                    status, answer = "timeout", "已达到任务时间上限。"
+                    break
+                # Each physical model attempt counts towards the shared budget.
                 self.store.append(sid, "model_request", {"model": self.model.name,
-                    "messages": prepared, "tools": schemas, "max_tokens": output_tokens})
-                reply = self.model.complete(prepared, schemas, output_tokens)
+                    "messages": prepared, "tools": schemas, "max_tokens": output_tokens,
+                    "remaining_seconds": seconds_left})
                 local_requests += 1
+                try:
+                    reply = self.model.complete(prepared, schemas, output_tokens, timeout=seconds_left)
+                except ModelError as exc:
+                    failed_attempts += 1
+                    if exc.access_denied:
+                        self._model_access_error = str(exc)
+                    self.store.append(sid, "model_error", {"attempt": failed_attempts, "error": str(exc),
+                        "retryable": exc.retryable, "access_denied": exc.access_denied})
+                    # Reserve output cap only when the provider may have generated tokens (e.g., 5xx/timeout/length).
+                    if exc.consume_output_budget:
+                        self.store.append(sid, "usage", {"input_tokens": estimated_input,
+                            "output_tokens": output_tokens, "estimated": True, "failed_attempt": True})
+                    else:
+                        self.store.append(sid, "usage", {"input_tokens": 0,
+                            "output_tokens": 0, "estimated": True, "failed_attempt": True})
+                    if time.monotonic() >= deadline:
+                        status, answer = "timeout", "已达到任务时间上限。"
+                        break
+                    if exc.access_denied or not exc.retryable or failed_attempts >= self.limits.model_attempts:
+                        raise
+                    usage = self.store.usage(sid)
+                    if (usage["requests"] >= self.limits.max_requests or (readonly and local_requests >= 6)
+                            or self.limits.max_tokens - usage["input_tokens"] - usage["output_tokens"]
+                            < estimated_input + min_output):
+                        break
+                    delay = exc.retry_after if exc.retry_after is not None else 0.5 * 2 ** (failed_attempts - 1)
+                    if delay >= deadline - time.monotonic():
+                        status, answer = "timeout", "剩余任务时间不足以等待模型重试。"
+                        break
+                    self.store.append(sid, "model_retry", {"next_attempt": failed_attempts + 1, "delay_seconds": delay})
+                    time.sleep(delay)
+                    continue
+                failed_attempts = 0
                 self.store.append(sid, "usage", {"input_tokens": reply.input_tokens,
                     "output_tokens": reply.output_tokens, "estimated": reply.estimated})
                 self.store.append(sid, "message", reply.message)
+                if time.monotonic() >= deadline:
+                    status, answer = "timeout", "已达到任务时间上限。"
+                    break
                 calls = reply.message.get("tool_calls", [])
                 if not calls:
                     status, answer = "completed", reply.message.get("content", "") or "模型已结束本轮任务。"
                     break
+                stop_batch = False
                 for call in calls:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError("任务时间预算已用尽")
+                        status, answer = "timeout", "已达到任务时间上限。"
+                        stop_batch = True
+                        break
                     name, cid = call["function"]["name"], call["id"]
+                    tool = registry.tools.get(name)
                     self.store.append(sid, "tool_started", {"call_id": cid, "name": name})
                     self.observe("tool", {"session_id": sid, "name": name})
+                    run_tests_snapshot = None
                     try:
                         args = json.loads(call["function"]["arguments"])
                         output = registry.invoke(name, args)
@@ -178,19 +236,39 @@ class Agent:
                         else:
                             result["output"] = output
                         if name == "run_tests":
+                            run_tests_snapshot = self.workspace.snapshot(use_cache=False)
                             self.store.append(sid, "verification", {"passed": output["passed"],
-                                "files": self.workspace.snapshot(), "artifact_id": aid})
+                                "files": run_tests_snapshot, "artifact_id": aid})
                     except (ToolError, ValueError, TypeError, OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
                         result = {"ok": False, "error": str(exc)[:1000]}
+                    except Exception as exc:
+                        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:1000]}
+                    if name == "run_tests" and tool and not result["ok"]:
+                        run_tests_snapshot = self.workspace.snapshot(use_cache=False)
+                        self.store.append(sid, "verification", {"passed": False, "files": run_tests_snapshot,
+                            "artifact_id": None})
                     self.store.append(sid, "tool_finished", {"call_id": cid, "name": name, "result": result})
                     self.store.append(sid, "message", {"role": "tool", "tool_call_id": cid,
                         "content": json.dumps(result, ensure_ascii=False)})
-                    self.store.append(sid, "checkpoint", {"files": self.workspace.snapshot()})
+                    if tool and tool.effect in {"write", "execute"}:
+                        snap = run_tests_snapshot if run_tests_snapshot is not None else self.workspace.snapshot(
+                            use_cache=(tool.effect == "write"))
+                        self.store.append(sid, "checkpoint", {"files": snap})
+                    if self._model_access_error:
+                        status, answer = "error", self._model_access_error
+                        stop_batch = True
+                        break
+                    if time.monotonic() >= deadline:
+                        status, answer = "timeout", "已达到任务时间上限。"
+                        stop_batch = True
+                        break
+                if stop_batch:
+                    break
         except KeyboardInterrupt:
             status, answer = "cancelled", "任务已中断，运行记录已保存。恢复前会检查未完成工具调用。"
-        except (ModelError, ValueError, OSError, TimeoutError) as exc:
+        except Exception as exc:
             status, answer = "error", str(exc)
-        current = self.workspace.snapshot()
+        current = self.workspace.snapshot(use_cache=False)
         changes = sorted(p for p in baseline.keys() | current.keys() if baseline.get(p) != current.get(p))
         checks = [e["data"] for e in self.store.events(sid) if e["kind"] == "verification"]
         verification = "not_run"

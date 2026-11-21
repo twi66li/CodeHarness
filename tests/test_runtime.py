@@ -1,14 +1,18 @@
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from codeharness.context import Context
 from codeharness.demo import DemoModel, create_demo
 from codeharness.models import ModelError
 from codeharness.runtime import Agent, Limits
 from codeharness.store import Store
-from codeharness.tools import Policy, Registry, ToolError, Workspace, digest, register_workspace_tools
+from codeharness.tools import Policy, Registry, Tool, ToolError, Workspace, digest, parameters, register_workspace_tools
 
 
 class ScriptModel:
@@ -17,9 +21,11 @@ class ScriptModel:
     def __init__(self, *steps):
         self.steps = iter(steps)
         self.requests = []
+        self.timeouts = []
 
-    def complete(self, messages, tools, max_tokens):
+    def complete(self, messages, tools, max_tokens, *, timeout=None):
         self.requests.append({"messages": messages, "tools": tools, "max_tokens": max_tokens})
+        self.timeouts.append(timeout)
         step = next(self.steps)
         return step(messages, tools) if callable(step) else step
 
@@ -94,9 +100,141 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_create_does_not_overwrite_existing_file(self):
         (self.root / "a.py").write_text("original", encoding="utf-8")
-        with self.assertRaises(FileExistsError):
+        with self.assertRaisesRegex(ToolError, "edit_file") as caught:
             self.registry.invoke("write_file", {"path": "a.py", "content": "changed"})
+        self.assertNotIn(str(self.root), str(caught.exception))
         self.assertEqual((self.root / "a.py").read_text(encoding="utf-8"), "original")
+
+    def test_write_and_edit_report_nonblocking_python_syntax_feedback(self):
+        created = self.registry.invoke("write_file", {"path": "broken.py", "content": "def f(:\n    pass\n"})
+        self.assertFalse(created["syntax_valid"])
+        self.assertEqual(created["syntax_error"]["line"], 1)
+        fixed = self.registry.invoke("edit_file", {
+            "path": "broken.py", "old_text": "def f(:", "new_text": "def f():",
+            "expected_sha256": created["sha256"],
+        })
+        self.assertTrue(fixed["syntax_valid"])
+
+    def test_search_glob_supports_zero_depth_double_star(self):
+        (self.root / "src").mkdir()
+        (self.root / "src" / "main.py").write_text("needle = 1\n", encoding="utf-8")
+        (self.root / "src" / "sub").mkdir()
+        (self.root / "src" / "sub" / "mod.py").write_text("needle = 2\n", encoding="utf-8")
+        res = self.registry.invoke("search", {"query": "needle", "glob": "src/**/*.py"})
+        self.assertEqual([m["path"] for m in res["matches"]], ["src/main.py", "src/sub/mod.py"])
+
+    def test_edit_file_supports_crlf_and_bom_multiline(self):
+        file = self.root / "win.py"
+        original = "\ufeffdef f():\r\n    a = 1\r\n    return a\r\n".encode("utf-8")
+        file.write_bytes(original)
+        read = self.registry.invoke("read_file", {"path": "win.py"})
+        self.registry.invoke("edit_file", {
+            "path": "win.py",
+            "old_text": "def f():\n    a = 1",
+            "new_text": "def f():\n    a = 2",
+            "expected_sha256": read["sha256"],
+        })
+        updated = file.read_bytes()
+        self.assertTrue(updated.startswith(b"\xef\xbb\xbf"))
+        self.assertIn(b"    a = 2\r\n", updated)
+        self.assertNotIn(b"\n", updated.replace(b"\r\n", b""))
+
+    def test_read_file_rejects_directory_and_missing_file(self):
+        (self.root / "sub").mkdir()
+        with self.assertRaisesRegex(ToolError, "不是文件"):
+            self.registry.invoke("read_file", {"path": "sub"})
+        with self.assertRaisesRegex(ToolError, "不存在"):
+            self.registry.invoke("read_file", {"path": "missing.py"})
+
+    def test_registry_validates_extended_json_schema_types(self):
+        self.registry.register(Tool("ext", "扩展参数测试", parameters({
+            "flag": {"type": "boolean"},
+            "count": {"type": "integer"},
+            "ratio": {"type": "number"},
+            "items": {"type": "array"},
+            "meta": {"type": "object"},
+        }, ["flag", "count", "ratio", "items", "meta"]), lambda **kw: kw))
+        out = self.registry.invoke("ext", {
+            "flag": True, "count": 2, "ratio": 0.5, "items": ["a"], "meta": {"k": 1}})
+        self.assertTrue(out["flag"])
+        with self.assertRaisesRegex(ToolError, "count"):
+            self.registry.invoke("ext", {
+                "flag": True, "count": True, "ratio": 0.5, "items": [], "meta": {}})
+        with self.assertRaisesRegex(ToolError, "ratio"):
+            self.registry.invoke("ext", {
+                "flag": True, "count": 1, "ratio": False, "items": [], "meta": {}})
+
+    def test_snapshot_cache_tracks_write_and_delete(self):
+        self.registry.invoke("write_file", {"path": "a.py", "content": "one"})
+        first = self.workspace.snapshot()
+        self.assertEqual(first["a.py"], digest(b"one"))
+        self.registry.invoke("edit_file", {
+            "path": "a.py", "old_text": "one", "new_text": "two", "expected_sha256": first["a.py"]})
+        second = self.workspace.snapshot()
+        self.assertEqual(second["a.py"], digest(b"two"))
+        (self.root / "a.py").unlink()
+        self.assertEqual(self.workspace.snapshot(), {})
+        self.assertEqual(self.workspace._digest_cache, {})
+
+    def test_search_glob_and_syntax_diagnostics(self):
+        (self.root / "sub").mkdir()
+        (self.root / "sub" / "a.py").write_text("value = 1\n", encoding="utf-8")
+        (self.root / "a.py").write_text("value =\n", encoding="utf-8")
+        (self.root / "a.txt").write_text("value", encoding="utf-8")
+        matches = self.registry.invoke("search", {"query": "value", "glob": "**/*.py"})["matches"]
+        self.assertEqual({m["path"] for m in matches}, {"a.py", "sub/a.py"})
+        self.assertTrue(self.registry.invoke("check_syntax", {"path": "sub/a.py"})["valid"])
+        invalid = self.registry.invoke("check_syntax", {"path": "a.py"})
+        self.assertFalse(invalid["valid"])
+        self.assertEqual(invalid["line"], 1)
+
+    def test_unittest_single_file(self):
+        (self.root / "tests").mkdir()
+        for name, value in (("test_ok.py", "True"), ("test_fail.py", "False")):
+            (self.root / "tests" / name).write_text(
+                f"import unittest\nclass T(unittest.TestCase):\n def test_value(self): self.assertTrue({value})\n",
+                encoding="utf-8")
+        selected = self.registry.invoke("run_tests", {"path": "tests/test_ok.py"})
+        self.assertTrue(selected["passed"])
+        self.assertFalse(self.registry.invoke("run_tests", {"path": "tests"})["passed"])
+
+    def test_tests_use_remaining_deadline(self):
+        (self.root / "tests").mkdir()
+        registry = Registry(self.workspace, Policy(allow_exec=True))
+        register_workspace_tools(registry, deadline=12.0)
+        with patch("os.environ", {**os.environ, "DASHSCOPE_API_KEY": "FAKE_FIXTURE_KEY"}), \
+                patch("codeharness.tools.time.monotonic", return_value=10.0), \
+                patch("codeharness.tools.subprocess.Popen") as launch:
+            process = launch.return_value
+            process.returncode = 0
+            process.communicate.return_value = (b"Ran 1 test\nOK\n", None)
+            self.assertTrue(registry.invoke("run_tests", {})["passed"])
+            process.communicate.assert_called_once_with(timeout=2.0)
+            self.assertNotIn("DASHSCOPE_API_KEY", launch.call_args.kwargs["env"])
+
+    def test_git_tools_are_unavailable_in_plain_directories(self):
+        self.assertTrue({"git_status", "git_diff"}.isdisjoint(self.registry.tools))
+
+    def test_git_evidence_is_read_only_and_excludes_protected_paths(self):
+        (self.root / "a.py").write_text("before = 1\n", encoding="utf-8")
+        (self.root / ".env").write_text("FIXTURE_ONLY=before\n", encoding="utf-8")
+        commands = [["git", "init", "-q"], ["git", "add", "-f", "a.py", ".env"],
+                    ["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                     "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"]]
+        for command in commands:
+            subprocess.run(command, cwd=self.root, check=True, capture_output=True)
+        (self.root / "a.py").write_text("after = 2\n", encoding="utf-8")
+        (self.root / ".env").write_text("FIXTURE_ONLY=after\n", encoding="utf-8")
+        (self.root / "new.py").write_text("pass\n", encoding="utf-8")
+        registry = Registry(self.workspace, Policy(readonly=True))
+        register_workspace_tools(registry)
+        status = registry.invoke("git_status", {})
+        self.assertEqual({e["path"] for e in status["entries"]}, {"a.py", "new.py"})
+        diff = registry.invoke("git_diff", {})
+        self.assertEqual(diff["files"], ["a.py"])
+        self.assertIn("after = 2", diff["diff"])
+        self.assertNotIn("FIXTURE_ONLY", diff["diff"])
+        self.assertEqual((self.root / "a.py").read_text(encoding="utf-8"), "after = 2\n")
 
 
 class RuntimeTests(unittest.TestCase):
@@ -127,6 +265,14 @@ class RuntimeTests(unittest.TestCase):
         checks = [e["data"]["passed"] for e in self.store.events(result.session_id) if e["kind"] == "verification"]
         self.assertEqual(checks, [False, True])
 
+    def test_demo_without_delegate_has_same_result_with_no_child(self):
+        workspace = self.root / "demo"
+        create_demo(workspace)
+        result = Agent(DemoModel(), workspace, self.store, Policy(True, True), enable_delegate=False).run("修复折扣")
+        self.assertEqual((result.status, result.changed_files), ("verified", ["basket.py"]))
+        self.assertEqual(result.usage["requests"], 5)
+        self.assertEqual(len(self.store.sessions()), 1)
+
     def test_unverified_changes_cannot_be_reported_as_verified(self):
         model = ScriptModel(DemoModel.call("write_file", {"path": "a.py", "content": "pass"}),
                             DemoModel.text("全部验证通过"))
@@ -142,6 +288,24 @@ class RuntimeTests(unittest.TestCase):
                             DemoModel.call("run_tests", {}), DemoModel.text("成功"))
         result = self.agent(model).run("实现功能")
         self.assertEqual((result.status, result.verification), ("unverified", "failed"))
+
+    def test_verification_checks_current_content_even_if_metadata_is_unchanged(self):
+        (self.root / "tests").mkdir()
+        (self.root / "tests" / "test_ok.py").write_text(
+            "import unittest\nclass T(unittest.TestCase):\n def test_ok(self): self.assertTrue(True)\n",
+            encoding="utf-8")
+        file = self.root / "a.py"
+
+        def finish(messages, tools):
+            stat = file.stat()
+            file.write_bytes(b"x = 2\n")
+            os.utime(file, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            return DemoModel.text("完成")
+
+        model = ScriptModel(DemoModel.call("write_file", {"path": "a.py", "content": "x = 1\n"}),
+                            DemoModel.call("run_tests", {}), finish)
+        result = self.agent(model).run("实现功能")
+        self.assertEqual((result.status, result.verification), ("unverified", "stale"))
 
     def test_budget_is_shared_with_readonly_child(self):
         model = ScriptModel(DemoModel.call("delegate", {"task": "列出文件"}),
@@ -161,10 +325,13 @@ class RuntimeTests(unittest.TestCase):
         result = self.agent(model).run("检查权限")
         self.assertEqual(result.status, "completed")
         self.assertFalse((self.root / "illegal.py").exists())
+        children = [s for s in self.store.sessions() if s["parent_id"] == result.session_id]
+        self.assertEqual([s["status"] for s in children], ["completed"])
 
     def test_actual_model_inputs_can_be_reconstructed(self):
         model = ScriptModel(DemoModel.call("list_files", {}), DemoModel.text("完成"))
         result = self.agent(model).run("列出文件")
+        self.assertEqual(result.status, "completed")
         requests = [e["data"] for e in self.store.events(result.session_id) if e["kind"] == "model_request"]
         self.assertEqual(len(requests), len(model.requests))
         for sent, saved in zip(model.requests, requests):
@@ -188,6 +355,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(any(m["role"] == "user" and "once.py" in m["content"] for m in messages))
             return DemoModel.text("检查后保留已有文件")
         result = self.agent(ScriptModel(check_recovery)).run("继续", session_id=sid)
+        self.assertEqual(result.status, "unverified")
         self.assertEqual((self.root / "once.py").read_text(encoding="utf-8"), "once")
         self.assertEqual(result.changed_files, ["once.py"])
 
@@ -214,19 +382,194 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(resumed.status, "completed")
         self.assertEqual(resumed.usage["requests"], 2)
 
+    def test_model_retry_counts_attempts_and_unknown_usage(self):
+        def transient(messages, tools):
+            raise ModelError("HTTP 429", retryable=True, retry_after=0)
+        model = ScriptModel(transient, DemoModel.text("恢复"))
+        with patch("codeharness.runtime.time.sleep") as sleep:
+            result = self.agent(model, limits=Limits(max_seconds=5)).run("检查")
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.usage["requests"], 2)
+        self.assertTrue(result.usage["estimated"])
+        self.assertTrue(all(0 < value <= 5 for value in model.timeouts))
+        sleep.assert_called_once_with(0)
+        events = self.store.events(result.session_id)
+        self.assertEqual(len([e for e in events if e["kind"] == "model_retry"]), 1)
+        self.assertEqual(len([e for e in events if e["kind"] == "usage" and e["data"].get("failed_attempt")]), 1)
+
+    def test_retry_never_exceeds_request_budget(self):
+        def transient(messages, tools):
+            raise ModelError("HTTP 503", retryable=True, retry_after=0)
+        model = ScriptModel(transient, DemoModel.text("不应发送"))
+        with patch("codeharness.runtime.time.sleep") as sleep:
+            result = self.agent(model, limits=Limits(max_requests=1)).run("检查")
+        self.assertEqual(result.status, "budget_exhausted")
+        self.assertEqual(result.usage["requests"], 1)
+        sleep.assert_not_called()
+
+    def test_rate_limit_retry_does_not_burn_output_token_budget(self):
+        def limited(messages, tools):
+            raise ModelError("HTTP 429", retryable=True, retry_after=0, consume_output_budget=False)
+        model = ScriptModel(limited, limited, DemoModel.text("恢复成功"))
+        with patch("codeharness.runtime.time.sleep"):
+            result = self.agent(model, limits=Limits(max_requests=4, max_tokens=2000, output_tokens=1500)).run("检查")
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.usage["requests"], 3)
+        self.assertEqual(result.usage["output_tokens"], 30)
+
+    def test_retry_never_exceeds_estimated_token_budget(self):
+        def transient(messages, tools):
+            raise ModelError("HTTP 503", retryable=True, retry_after=0)
+        model = ScriptModel(transient, DemoModel.text("不应发送"))
+        limits = Limits(output_tokens=256)
+        agent = self.agent(model, limits=limits)
+        context = Context(self.root, limits.context_chars)
+        messages = [{"role": "system", "content": context.system()}, {"role": "user", "content": "检查"}]
+        schemas = agent._registry("unused", context, False, 0).schemas()
+        limits.max_tokens = len(json.dumps([messages, schemas], ensure_ascii=False)) // 3 + 1 + 256
+        with patch("codeharness.runtime.time.sleep") as sleep:
+            result = agent.run("检查")
+        self.assertEqual(result.status, "budget_exhausted")
+        self.assertEqual(result.usage["requests"], 1)
+        self.assertEqual(result.usage["input_tokens"] + result.usage["output_tokens"], limits.max_tokens)
+        sleep.assert_not_called()
+
+    def test_retry_does_not_wait_past_deadline(self):
+        def transient(messages, tools):
+            raise ModelError("HTTP 429", retryable=True, retry_after=60)
+        with patch("codeharness.runtime.time.sleep") as sleep:
+            result = self.agent(ScriptModel(transient), limits=Limits(max_seconds=5)).run("检查")
+        self.assertEqual(result.status, "timeout")
+        self.assertEqual(result.usage["requests"], 1)
+        sleep.assert_not_called()
+
+    def test_retry_attempt_limit(self):
+        def transient(messages, tools):
+            raise ModelError("HTTP 502", retryable=True, retry_after=0)
+        with patch("codeharness.runtime.time.sleep") as sleep:
+            result = self.agent(ScriptModel(transient, transient), limits=Limits(model_attempts=2)).run("检查")
+        self.assertEqual(result.status, "error")
+        self.assertEqual(result.usage["requests"], 2)
+        sleep.assert_called_once()
+
+    def test_access_denied_in_child_stops_root_tool_batch(self):
+        delegated = DemoModel.call("delegate", {"task": "检查项目"})
+        delegated.message["tool_calls"] += DemoModel.call("write_file", {"path": "later.py", "content": "pass"}).message["tool_calls"]
+
+        def denied(messages, tools):
+            raise ModelError("HTTP 401", access_denied=True)
+
+        model = ScriptModel(delegated, denied, DemoModel.text("不应发送"))
+        result = self.agent(model).run("检查项目")
+        self.assertEqual(result.status, "error")
+        self.assertEqual(result.usage["requests"], 2)
+        self.assertFalse((self.root / "later.py").exists())
+
+    def test_failed_test_invocation_invalidates_previous_verification(self):
+        (self.root / "tests").mkdir()
+        (self.root / "tests" / "test_ok.py").write_text(
+            "import unittest\nclass T(unittest.TestCase):\n def test_ok(self): self.assertTrue(True)\n", encoding="utf-8")
+        model = ScriptModel(DemoModel.call("write_file", {"path": "a.py", "content": "pass\n"}),
+                            DemoModel.call("run_tests", {}), DemoModel.call("run_tests", {"path": "missing"}),
+                            DemoModel.text("完成"))
+        result = self.agent(model).run("实现功能")
+        self.assertEqual((result.status, result.verification), ("unverified", "failed"))
+
     def test_skill_body_is_loaded_only_when_requested(self):
         directory = self.root / ".codeharness" / "skills" / "verify"
         directory.mkdir(parents=True)
-        (directory / "SKILL.md").write_text(
-            "---\ndescription: 验证方法\n---\nUNIQUE_SKILL_BODY", encoding="utf-8")
+        (directory / "SKILL.md").write_bytes(
+            "\ufeff---\ndescription: 验证方法\n---\nUNIQUE_SKILL_BODY".encode("utf-8"))
         def first(messages, tools):
             self.assertNotIn("UNIQUE_SKILL_BODY", messages[0]["content"])
             self.assertIn("验证方法", messages[0]["content"])
             return DemoModel.call("load_skill", {"name": "verify"})
         def second(messages, tools):
             self.assertIn("UNIQUE_SKILL_BODY", messages[0]["content"])
+            tool_msg = next(m for m in messages if m["role"] == "tool")
+            self.assertNotIn("UNIQUE_SKILL_BODY", tool_msg["content"])
             return DemoModel.text("完成")
-        self.agent(ScriptModel(first, second)).run("检查仓库")
+        result = self.agent(ScriptModel(first, second)).run("检查仓库")
+        self.assertEqual(result.status, "completed", result.answer)
+
+    def test_readonly_tools_do_not_write_intermediate_checkpoints(self):
+        (self.root / "a.py").write_text("x = 1\n", encoding="utf-8")
+        model = ScriptModel(DemoModel.call("list_files", {}),
+                            DemoModel.call("read_file", {"path": "a.py"}),
+                            DemoModel.text("完成"))
+        result = self.agent(model).run("只读检查")
+        checkpoints = [e for e in self.store.events(result.session_id) if e["kind"] == "checkpoint"]
+        self.assertEqual(len(checkpoints), 1)
+
+    def test_repair_pending_distinguishes_unstarted_and_interrupted_calls(self):
+        sid = self.store.create(self.root, "script-test")
+        c1 = DemoModel.call("write_file", {"path": "a.py", "content": "1"}).message["tool_calls"][0]
+        c2 = DemoModel.call("write_file", {"path": "b.py", "content": "2"}).message["tool_calls"][0]
+        self.store.append(sid, "message", {"role": "assistant", "content": "", "tool_calls": [c1, c2]})
+        self.store.append(sid, "tool_started", {"call_id": c1["id"], "name": "write_file"})
+        self.store.repair_pending(sid)
+        tools = {m["tool_call_id"]: json.loads(m["content"]) for m in self.store.messages(sid) if m["role"] == "tool"}
+        self.assertIn("不确定", tools[c1["id"]]["error"])
+        self.assertIn("尚未执行", tools[c2["id"]]["error"])
+        reconciled = {e["data"]["call_id"]: e["data"] for e in self.store.events(sid) if e["kind"] == "tool_reconciled"}
+        self.assertTrue(reconciled[c1["id"]]["started"])
+        self.assertFalse(reconciled[c2["id"]]["started"])
+
+    def test_resume_without_checkpoint_falls_back_to_baseline(self):
+        sid = self.store.create(self.root, "script-test")
+        self.store.append(sid, "baseline", {"files": {}})
+        self.store.append(sid, "message", {"role": "system", "content": Context(self.root).system()})
+        self.store.append(sid, "message", {"role": "user", "content": "检查"})
+        (self.root / "external.py").write_text("added", encoding="utf-8")
+        def check(messages, tools):
+            self.assertTrue(any(m["role"] == "user" and "external.py" in m["content"] for m in messages))
+            return DemoModel.text("已感知外部改动")
+        result = self.agent(ScriptModel(check)).run("继续", session_id=sid)
+        self.assertEqual(result.status, "unverified")
+        self.assertEqual(result.changed_files, ["external.py"])
+
+    def test_low_remaining_token_budget_stops_as_budget_exhausted(self):
+        model = ScriptModel(DemoModel.text("不应调用"))
+        result = self.agent(model, limits=Limits(max_tokens=300, output_tokens=2048)).run("检查")
+        self.assertEqual(result.status, "budget_exhausted")
+        self.assertEqual(len(model.requests), 0)
+
+    def test_timeout_inside_tool_loop_reports_timeout_status(self):
+        c1 = DemoModel.call("list_files", {}).message["tool_calls"][0]
+        c2 = DemoModel.call("list_files", {}).message["tool_calls"][0]
+        batch = DemoModel.text("")
+        batch.message = {"role": "assistant", "content": "", "tool_calls": [c1, c2]}
+        clock = [0.0]
+        def observe(kind, data):
+            if kind == "tool":
+                clock[0] = 11.0
+        with patch("codeharness.runtime.time.monotonic", side_effect=lambda: clock[0]):
+            result = self.agent(ScriptModel(batch), limits=Limits(max_seconds=10), observe=observe).run("批量读取")
+        self.assertEqual(result.status, "timeout")
+        started = [e["data"]["call_id"] for e in self.store.events(result.session_id) if e["kind"] == "tool_started"]
+        self.assertEqual(started, [c1["id"]])
+
+    def test_plugin_unexpected_error_does_not_leave_session_running(self):
+        bad_runtime = Path(self.temp.name) / "boom_plugin.py"
+        bad_runtime.write_text(
+            "from codeharness.tools import Tool, parameters\n"
+            "def register(r):\n"
+            "    r.register(Tool('boom', 'boom', parameters({}), lambda: (_ for _ in ()).throw(RuntimeError('kapow'))))\n",
+            encoding="utf-8",
+        )
+        def after_boom(messages, tools):
+            payload = json.loads(messages[-1]["content"])
+            self.assertFalse(payload["ok"])
+            self.assertIn("RuntimeError: kapow", payload["error"])
+            return DemoModel.text("已处理插件异常")
+        result = self.agent(ScriptModel(DemoModel.call("boom", {}), after_boom), plugins=[bad_runtime]).run("调用插件")
+        self.assertEqual(result.status, "completed")
+
+        bad_load = Path(self.temp.name) / "broken_load.py"
+        bad_load.write_text("def not_register(): pass\n", encoding="utf-8")
+        failed = self.agent(ScriptModel(), plugins=[bad_load]).run("加载坏插件")
+        self.assertEqual(failed.status, "error")
+        self.assertEqual(self.store.session(failed.session_id)["status"], "error")
 
     def test_artifacts_cannot_cross_root_sessions(self):
         one = self.store.create(self.root, "script")
@@ -258,12 +601,40 @@ class ContextTests(unittest.TestCase):
         messages.append({"role": "user", "content": "另外保留兼容性"})
         prepared, compacted = Context(Path.cwd(), max_chars=4000).prepare(messages)
         self.assertTrue(compacted)
+        systems = [m for m in prepared if m["role"] == "system"]
+        self.assertEqual(len(systems), 1)
+        self.assertEqual(prepared[0]["role"], "system")
         users = [m["content"] for m in prepared if m["role"] == "user"]
         self.assertEqual(users, ["不要修改公共接口", "另外保留兼容性"])
         calls = {c["id"] for m in prepared for c in m.get("tool_calls", [])}
         results = {m["tool_call_id"] for m in prepared if m["role"] == "tool"}
         self.assertEqual(calls, results)
         self.assertLess(len(json.dumps(prepared)), len(json.dumps(messages)))
+
+    def test_compaction_avoids_false_positive_and_trims_kept_tool_outputs(self):
+        minimal = [{"role": "system", "content": "s" * 3000}, {"role": "user", "content": "u" * 2000}]
+        prepared, compacted = Context(Path.cwd(), max_chars=2000).prepare(minimal)
+        self.assertFalse(compacted)
+        self.assertEqual(prepared, minimal)
+
+        c1 = DemoModel.call("read_file", {"path": "a.py"}).message
+        c2 = DemoModel.call("read_file", {"path": "b.py"}).message
+        heavy = [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "任务"},
+            c1,
+            {"role": "tool", "tool_call_id": c1["tool_calls"][0]["id"],
+             "content": json.dumps({"ok": True, "artifact_id": "aid-1", "output": "x" * 3000})},
+            c2,
+            {"role": "tool", "tool_call_id": c2["tool_calls"][0]["id"],
+             "content": json.dumps({"ok": True, "artifact_id": "aid-2", "output": "y" * 100})},
+        ]
+        trimmed, did_compact = Context(Path.cwd(), max_chars=2000).prepare(heavy)
+        self.assertTrue(did_compact)
+        first_tool = json.loads(trimmed[3]["content"])
+        self.assertEqual(first_tool["artifact_id"], "aid-1")
+        self.assertTrue(first_tool["truncated"])
+        self.assertLess(len(json.dumps(trimmed)), len(json.dumps(heavy)))
 
 
 if __name__ == "__main__":
