@@ -66,7 +66,7 @@ class LoopState:
 class Agent:
     def __init__(self, model: Model, workspace: Path, store: Store, policy: Policy | None = None,
                  limits: Limits | None = None, plugins: list[Path] | None = None,
-                 observe: Callable | None = None, enable_delegate: bool = True):
+                 observe: Callable | None = None, enable_delegate: bool = True, *, disabled_tools=()):
         self.model = model
         self.workspace = Workspace(workspace)
         self.store = store
@@ -75,6 +75,7 @@ class Agent:
         self.plugins = plugins or []
         self.observe = observe or (lambda kind, data: None)
         self.enable_delegate = enable_delegate
+        self.disabled_tools = frozenset(disabled_tools)
         self._model_access_error = None
 
     def _registry(self, sid: str, context: Context, readonly: bool, deadline: float) -> Registry:
@@ -118,6 +119,8 @@ class Agent:
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
                 module.register(registry)
+        for name in self.disabled_tools:
+            registry.tools.pop(name, None)
         return registry
 
     def run(self, task: str, session_id: str | None = None, parent_id: str | None = None,

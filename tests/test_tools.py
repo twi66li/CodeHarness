@@ -24,6 +24,79 @@ class RunTestsModel:
 
 
 class ToolTests(unittest.TestCase):
+    def test_unified_patch_updates_multiple_hunks_files_and_preserves_text_format(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "a.py").write_bytes(b"\xef\xbb\xbfalpha = 1\r\nbeta = 2\r\ngamma = 3\r\n")
+            (root / "old.txt").write_text("remove me\n", encoding="utf-8", newline="\n")
+            registry = Registry(Workspace(root), Policy(allow_write=True))
+            register_workspace_tools(registry)
+            result = registry.invoke("apply_patch", {"patch": (
+                "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-alpha = 1\n+alpha = 10\n"
+                "@@ -3 +3 @@\n-gamma = 3\n+gamma = 30\n"
+                "--- /dev/null\n+++ b/new.py\n@@ -0,0 +1 @@\n+added = 1\n"
+                "--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-remove me\n"
+            )})
+            self.assertEqual((root / "a.py").read_bytes(), b"\xef\xbb\xbfalpha = 10\r\nbeta = 2\r\ngamma = 30\r\n")
+            self.assertEqual((root / "new.py").read_text(encoding="utf-8"), "added = 1\n")
+            self.assertFalse((root / "old.txt").exists())
+            self.assertEqual([item["path"] for item in result["files"]], ["a.py", "new.py", "old.txt"])
+            self.assertTrue(result["files"][0]["syntax_valid"])
+
+    def test_unified_patch_validates_every_file_before_any_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("a.txt", "b.txt", ".env"):
+                (root / name).write_text("original\n", encoding="utf-8", newline="\n")
+            registry = Registry(Workspace(root), Policy(allow_write=True))
+            register_workspace_tools(registry)
+            first = "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-original\n+changed\n"
+            for target, old in (("b.txt", "does not match"), ("../outside.txt", "original"), (".env", "original")):
+                rest = f"--- {target}\n+++ {target}\n@@ -1 +1 @@\n-{old}\n+changed\n"
+                with self.subTest(target=target), self.assertRaises(ToolError):
+                    registry.invoke("apply_patch", {"patch": first + rest})
+                self.assertEqual((root / "a.txt").read_text(encoding="utf-8"), "original\n")
+            registry.policy = Policy(allow_write=True, readonly=True)
+            with self.assertRaisesRegex(ToolError, "只读"):
+                registry.invoke("apply_patch", {"patch": first})
+
+    def test_unified_patch_reverts_earlier_files_if_a_later_replace_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            a, b = root / "a.txt", root / "b.txt"
+            for path in (a, b):
+                path.write_text("original\n", encoding="utf-8", newline="\n")
+            registry = Registry(Workspace(root), Policy(allow_write=True))
+            register_workspace_tools(registry)
+            original_replace = os.replace
+
+            def replace(source, dest):
+                if dest == b:
+                    raise PermissionError("fixture lock")
+                return original_replace(source, dest)
+
+            patch_text = "".join(f"--- {name}\n+++ {name}\n@@ -1 +1 @@\n-original\n+changed\n" for name in (a.name, b.name))
+            with patch("codeharness.tools.os.replace", side_effect=replace), self.assertRaises(PermissionError):
+                registry.invoke("apply_patch", {"patch": patch_text})
+            self.assertEqual([path.read_text(encoding="utf-8") for path in (a, b)], ["original\n"] * 2)
+
+    def test_cli_disable_tool_omits_patch_from_model_schema(self):
+        offered = set()
+
+        class InspectTools:
+            name = "fixture"
+
+            def complete(self, messages, tools, max_tokens, *, timeout=None):
+                offered.update(tool["function"]["name"] for tool in tools)
+                return DemoModel.text("完成")
+
+        with tempfile.TemporaryDirectory() as temp, patch("codeharness.cli.ChatModel", return_value=InspectTools()), \
+                redirect_stdout(StringIO()):
+            self.assertEqual(cli(["run", "查看工具", "--workspace", temp, "--model", "fixture", "--json",
+                                  "--base-url", "https://fixture.invalid/v1", "--disable-tool", "apply_patch"]), 0)
+        self.assertNotIn("apply_patch", offered)
+        self.assertIn("edit_file", offered)
+
     def test_git_ignored_files_are_absent_from_list_snapshot_and_search(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

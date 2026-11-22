@@ -106,6 +106,7 @@ def parser() -> argparse.ArgumentParser:
     execution.add_argument("--max-seconds", type=int, default=600, help="任务时间预算，在调用边界检查")
     execution.add_argument("--model-attempts", type=int, default=3, help="每轮模型最多尝试次数（含首次，重试计入总预算）")
     execution.add_argument("--no-delegate", action="store_true", help="禁用只读任务委派，便于消融分析")
+    execution.add_argument("--disable-tool", action="append", default=[], metavar="NAME", help="禁用一个工具，可重复")
     execution.add_argument("--plugin", type=Path, action="append", default=[], help="加载可信 Python 扩展（本机权限）")
     run = commands.add_parser("run", parents=[common, execution], help="开始一个仓库任务")
     run.add_argument("task")
@@ -213,7 +214,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"切换模型：{data['previous']} → {data['model']}", flush=True)
 
         result = Agent(model, workspace, store, policy, limits, plugins, observe,
-                       enable_delegate=not getattr(args, "no_delegate", False)).run(task, session_id=sid)
+                       enable_delegate=not getattr(args, "no_delegate", False),
+                       disabled_tools=getattr(args, "disable_tool", ())).run(task, session_id=sid)
         output = {**asdict(result), "workspace": str(workspace), "store": str(store.path)}
         if args.json:
             print(json.dumps(output, ensure_ascii=False, indent=2))

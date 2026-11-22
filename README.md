@@ -87,6 +87,7 @@ Token 预算在请求前估算、返回后按 usage 校正；仅对可能已产�
 测试在本机执行；路径检查、权限和 Git worktree 不构成操作系统沙箱。
 测试工具和独立验收使用环境变量白名单。`run`、`resume` 可用 `--pass-env NAME` 显式传递进程变量，敏感名称会触发提示。常见私钥和凭据文件名会被工作区工具过滤。
 Git 工作区中的未跟踪忽略文件不参与列表、搜索或 `changed_files`。`search` 支持 `regex` 和 `max_results`，正则搜索在可用时使用 ripgrep。
+需要多处或多文件修改时，可使用统一 diff 的 `apply_patch`。工具会先校验全部片段，再逐文件替换。`run`、`resume` 和 `benchmark` 可用 `--disable-tool apply_patch` 禁用它。
 扩展是可信本地 Python 代码，拥有宿主权限；只读子任务不加载自定义扩展。
 当前不提供任意 Shell、并行写入或第三方插件兼容性。
 

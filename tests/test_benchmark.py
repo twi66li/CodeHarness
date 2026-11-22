@@ -39,6 +39,21 @@ class PatchModel:
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_benchmark_disables_patch_tool_for_the_actual_case(self):
+        offered = set()
+
+        class InspectTools(TextOnlyModel):
+            def complete(self, messages, tools, max_tokens, *, timeout=None):
+                offered.update(tool["function"]["name"] for tool in tools)
+                return super().complete(messages, tools, max_tokens, timeout=timeout)
+
+        with tempfile.TemporaryDirectory() as temp:
+            report = run_suite(TASKS[:1], Path(temp) / "bench", model=InspectTools(),
+                               total_requests=12, total_tokens=24000, disabled_tools=("apply_patch",))
+        self.assertNotIn("apply_patch", offered)
+        self.assertIn("edit_file", offered)
+        self.assertEqual(report["disabled_tools"], ["apply_patch"])
+
     def test_estimate_error_uses_only_measured_pairs_with_estimates(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

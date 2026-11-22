@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Callable
 
@@ -29,7 +30,8 @@ TEST_ENV_NAMES = {
 
 def protected(name: str) -> bool:
     name = name.casefold()
-    return (name in HIDDEN or name in PRIVATE_FILENAMES or name.startswith((".env", "id_rsa", "id_ed25519"))
+    return (name in HIDDEN or name in PRIVATE_FILENAMES or
+            name.startswith((".env", "id_rsa", "id_ed25519", ".codeharness-patch-"))
             or name.endswith((".pem", ".key", ".p12")))
 
 
@@ -130,6 +132,115 @@ class Workspace:
 
 def digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def parse_unified_patch(patch: str):
+    lines = patch.replace("\r\n", "\n").splitlines(keepends=True)
+    index = 0
+    while index < len(lines):
+        if not lines[index].strip() or lines[index].startswith(("diff --git ", "index ", "new file mode ", "deleted file mode ")):
+            index += 1
+            continue
+        if index + 1 >= len(lines) or not lines[index].startswith("--- ") or not lines[index + 1].startswith("+++ "):
+            raise ToolError(f"补丁第 {index + 1} 行缺少成对的文件头")
+        old = lines[index][4:].rstrip("\n").split("\t", 1)[0]
+        new = lines[index + 1][4:].rstrip("\n").split("\t", 1)[0]
+        if old.startswith("a/") and (new.startswith("b/") or new == "/dev/null"):
+            old = old[2:]
+        if new.startswith("b/") and (old == "/dev/null" or old == new[2:]):
+            new = new[2:]
+        if not old or not new or (old != new and "/dev/null" not in (old, new)) or old == new == "/dev/null":
+            raise ToolError("文件头必须指向同一文件，新增或删除用 /dev/null")
+        index += 2
+        hunks = []
+        while index < len(lines) and lines[index].startswith("@@"):
+            header = re.fullmatch(r"@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@.*", lines[index].rstrip("\n"))
+            if header is None:
+                raise ToolError(f"{old} 的补丁片段头无效")
+            offset, before_count, after_count = (int(part) if part is not None else 1 for part in header.groups())
+            index += 1
+            before, after = [], []
+            while len(before) < before_count or len(after) < after_count:
+                if index == len(lines) or lines[index][:1] not in {" ", "+", "-"}:
+                    raise ToolError(f"{old} 的补丁片段行数与声明不符")
+                sign, line = lines[index][0], lines[index][1:]
+                index += 1
+                if index < len(lines) and lines[index].rstrip("\n") == "\\ No newline at end of file":
+                    line = line.removesuffix("\n")
+                    index += 1
+                elif not line.endswith("\n"):
+                    line += "\n"
+                if sign != "+":
+                    before.append(line)
+                if sign != "-":
+                    after.append(line)
+            if len(before) != before_count or len(after) != after_count or not (before or after):
+                raise ToolError(f"{old} 的补丁片段行数无效")
+            hunks.append((offset, before, after))
+        if not hunks:
+            raise ToolError(f"{old} 没有补丁片段")
+        yield old, new, hunks
+
+
+def patch_text(path: str, text: str, hunks) -> str:
+    lines = text.replace("\r\n", "\n").splitlines(keepends=True)
+    shift = 0
+    for number, (offset, old, new) in enumerate(hunks, 1):
+        if old:
+            positions = [i for i, line in enumerate(lines) if line == old[0] and lines[i:i + len(old)] == old]
+            if len(positions) != 1:
+                raise ToolError(f"{path} 的第 {number} 个片段原文必须唯一匹配")
+            position = positions[0]
+        else:
+            position = offset + shift
+            if not 0 <= position <= len(lines):
+                raise ToolError(f"{path} 的第 {number} 个插入位置无效")
+        lines[position:position + len(old)] = new
+        shift += len(new) - len(old)
+    updated = "".join(lines)
+    return updated.replace("\n", "\r\n") if "\r\n" in text else updated
+
+
+def replace_patch_files(updates):
+    staged, applied = [], []
+    temporary = []
+
+    def stage(path, content, mode):
+        if content is None:
+            return None
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".codeharness-patch-", delete=False) as stream:
+            temp = Path(stream.name)
+            temporary.append(temp)
+            stream.write(content)
+        temp.chmod(mode)
+        return temp
+
+    try:
+        for _, path, before, after in updates:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            mode = path.stat().st_mode & 0o777 if before is not None else 0o644
+            staged.append((path, before, stage(path, before, mode), stage(path, after, mode)))
+        for path, before, backup, after in staged:
+            current = path.read_bytes() if path.exists() else None
+            if current != before:
+                raise ToolError(f"补丁验证后文件已变化：{path.name}")
+            if after is None:
+                path.unlink()
+            elif before is None:
+                os.link(after, path)
+            else:
+                os.replace(after, path)
+            applied.append((path, backup))
+    except (OSError, ToolError):
+        for path, backup in reversed(applied):
+            if backup is None:
+                path.unlink()
+            else:
+                os.replace(backup, path)
+        raise
+    finally:
+        for path in temporary:
+            path.unlink(missing_ok=True)
 
 
 @dataclass
@@ -438,6 +549,33 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None):
         raw = target.read_bytes()
         return {"path": path, "sha256": workspace._cache_digest(target, raw), **syntax_info(path, raw)}
 
+    def apply_patch(patch):
+        updates = []
+        seen = set()
+        for old, new, hunks in parse_unified_patch(patch):
+            path = new if new != "/dev/null" else old
+            target = workspace.path(path)
+            if target in seen:
+                raise ToolError(f"补丁重复指定文件：{path}")
+            seen.add(target)
+            exists = target.exists()
+            if exists != (old != "/dev/null") or (exists and not target.is_file()):
+                raise ToolError(f"补丁文件头与磁盘状态不符：{path}")
+            before = target.read_bytes() if exists else None
+            text = before.decode("utf-8-sig") if before is not None else ""
+            fixed = patch_text(path, text, hunks)
+            if new == "/dev/null" and fixed:
+                raise ToolError(f"删除片段未覆盖整个文件：{path}")
+            encoding = "utf-8-sig" if before and before.startswith(b"\xef\xbb\xbf") else "utf-8"
+            after = None if new == "/dev/null" else fixed.encode(encoding)
+            updates.append((path, target, before, after))
+        if not updates:
+            raise ToolError("补丁不能为空")
+        replace_patch_files(updates)
+        return {"files": [{"path": path, "before_sha256": digest(before) if before is not None else None,
+            "after_sha256": workspace._cache_digest(target, after) if after is not None else None,
+            **(syntax_info(path, after) if after is not None else {})} for path, target, before, after in updates]}
+
     def run_tests(path="tests", runner="unittest"):
         target = workspace.path(path)
         if runner == "unittest":
@@ -486,6 +624,8 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None):
             ["path", "old_text", "new_text", "expected_sha256"]), edit_file, "write"),
         Tool("write_file", "仅用于创建尚不存在的新文件；修改已有文件必须使用 edit_file。", parameters({
             "path": string("相对文件路径"), "content": string("文件内容")}, ["path", "content"]), write_file, "write"),
+        Tool("apply_patch", "应用多片段或多文件的统一 diff。先读取文件，原文片段必须唯一匹配。",
+             parameters({"patch": string("统一 diff，包含 ---、+++ 与 @@ 片段头")}, ["patch"]), apply_patch, "write"),
         Tool("run_tests", "在工作区运行测试，最多 60 秒；会执行项目代码，需要执行授权。", parameters({
             "path": string("测试目录或测试文件，默认 tests"),
             "runner": {"type": "string", "enum": ["unittest", "pytest"]}}), run_tests, "execute"),

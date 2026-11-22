@@ -116,7 +116,8 @@ def diagnostics(store: Store) -> dict:
     return result
 
 
-def run_case(task: Task, variant: str, output: Path, directory: Path, model: Model | None, limits: Limits) -> dict:
+def run_case(task: Task, variant: str, output: Path, directory: Path, model: Model | None, limits: Limits,
+             disabled_tools: tuple[str, ...]) -> dict:
     started = time.monotonic()
     workspace, verifier, baseline = prepare_case(task, directory)
     row = {"task": task.id, "variant": variant, "workspace": str(workspace.relative_to(output)), "baseline": baseline}
@@ -130,7 +131,7 @@ def run_case(task: Task, variant: str, output: Path, directory: Path, model: Mod
         store = Store(directory / "state.sqlite3")
         try:
             result = Agent(model, workspace, store, Policy(allow_write=True, allow_exec=True), limits,
-                           enable_delegate=variant == "delegate").run(task.prompt)
+                           enable_delegate=variant == "delegate", disabled_tools=disabled_tools).run(task.prompt)
             evidence = diagnostics(store)
         finally:
             store.close()
@@ -147,7 +148,7 @@ def run_case(task: Task, variant: str, output: Path, directory: Path, model: Mod
 
 def run_suite(tasks: tuple[Task, ...], output: Path, *, model: Model | None = None,
               limits: Limits | None = None, variants: tuple[str, ...] = ("delegate",),
-              total_requests: int | None = None, total_tokens: int | None = None) -> dict:
+              total_requests: int | None = None, total_tokens: int | None = None, disabled_tools: tuple[str, ...] = ()) -> dict:
     if not tasks:
         raise ValueError("评测任务不能为空")
     limits = limits or Limits(max_requests=12, max_tokens=24000, max_seconds=180)
@@ -167,6 +168,8 @@ def run_suite(tasks: tuple[Task, ...], output: Path, *, model: Model | None = No
               "cases": [], "summary": {}}
     if isinstance(model, ChatModel) and model.reasoning_effort is not None:
         report["reasoning_effort"] = model.reasoning_effort
+    if disabled_tools:
+        report["disabled_tools"] = list(disabled_tools)
 
     pool = model if isinstance(model, ModelPool) else None
     variants = variants if model is not None else ("reference",)
@@ -213,7 +216,7 @@ def run_suite(tasks: tuple[Task, ...], output: Path, *, model: Model | None = No
                     row = {"task": task.id, "variant": variant, "skipped": skipped}
                 else:
                     directory = output / task.id / variant
-                    row = run_case(task, variant, output, directory / chosen if chosen else directory, model, limits)
+                    row = run_case(task, variant, output, directory / chosen if chosen else directory, model, limits, disabled_tools)
                     access_denied = row.get("model_access_denied", False)
                     usage = row.get("usage", {})
                     used_requests += usage.get("requests", 0)
@@ -245,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
                            help="core=5 个基础任务；full=12 个基础任务；multi=3 个 11 文件多模块后端任务")
     selection.add_argument("--task", choices=tuple(task.id for task in ALL_TASKS), help="仅运行一个指定任务，适合低预算联调")
     parser.add_argument("--variants", choices=("delegate", "no-delegate", "both"), default="delegate")
+    parser.add_argument("--disable-tool", action="append", default=[], metavar="NAME", help="禁用一个工具，可重复")
     parser.add_argument("--output", type=Path, help="新建报告目录；默认 .codeharness/benchmarks/<id>")
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--model")
@@ -287,7 +291,8 @@ def main(argv: list[str] | None = None) -> int:
         report = run_suite(tasks, output, model=model,
             limits=Limits(max_requests=args.max_requests, max_tokens=args.max_tokens,
                           output_tokens=args.output_tokens, max_seconds=args.max_seconds),
-            variants=variants, total_requests=args.total_requests, total_tokens=args.total_tokens)
+            variants=variants, total_requests=args.total_requests, total_tokens=args.total_tokens,
+            disabled_tools=tuple(args.disable_tool))
         print(json.dumps({"mode": report["mode"], "report": str(output.resolve() / "report.json"),
                           "summary": report["summary"]}, ensure_ascii=False, indent=2))
         rows = report["cases"]

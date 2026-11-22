@@ -497,7 +497,7 @@ class RuntimeTests(unittest.TestCase):
     def test_child_has_no_write_execute_or_recursive_delegate_tools(self):
         def inspect(messages, tools):
             names = {tool["function"]["name"] for tool in tools}
-            self.assertFalse({"write_file", "edit_file", "run_tests", "delegate"} & names)
+            self.assertFalse({"write_file", "edit_file", "apply_patch", "run_tests", "delegate"} & names)
             return DemoModel.call("write_file", {"path": "illegal.py", "content": "x"})
         model = ScriptModel(DemoModel.call("delegate", {"task": "尝试写入"}), inspect,
                             DemoModel.text("权限已阻止"), DemoModel.text("结束"))
