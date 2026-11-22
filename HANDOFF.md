@@ -252,7 +252,7 @@ git worktree remove D:\wt\ch-pre
 | M0 实测 | ☐ | 待确认 `qwen3.8-flash` 和 `deepseek-v4.1-flash-1017` 额度；S1 可使用假模型独立推进。 |
 | S1 | ☑ | 本地快进合并 `707f8496ee9ccd87b8c05427596e76876981d3a2`。[回归摘要](.codeharness/regress/s1-20261122-234735/summary.json)。`Agent.run` 26 行，最长拆出方法 51 行。83 项中 82 通过、1 跳过，夹具和 demo 结果与 S0 一致。待阶段推送。 |
 | S2 | ☑ | 本地快进合并 `8e51318d8fea9734e1b42615392b57785b8dfb06`。[回归摘要](.codeharness/regress/s2-20261122-235055/summary.json)。86 项中 85 通过、1 跳过，已验证截断恢复、原样记账及旧会话继续执行。待阶段推送。 |
-| S3 | ☐ | |
+| S3 | ☑ | 本地快进合并 `6bf420e1107b9eb7bdebd9e13a7cbbfbaf5bb023`。[回归摘要](.codeharness/regress/s3-20261122-235546/summary.json)。90 项中 89 通过、1 跳过，已验证重复提示、恢复后计数和停止状态。待阶段推送。 |
 | S4 | ☐ | |
 | S5 | ☐ | |
 | S6 | ☐ | |

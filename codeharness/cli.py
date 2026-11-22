@@ -98,6 +98,7 @@ def parser() -> argparse.ArgumentParser:
     execution.add_argument("--base-url", help="兼容 Chat Completions 的地址，包含 /v1 等前缀")
     execution.add_argument("--allow-write", action="store_true", help="授权修改工作区文件")
     execution.add_argument("--allow-exec", action="store_true", help="授权在本机执行项目测试（不是 OS 沙箱）")
+    execution.add_argument("--pass-env", action="append", default=[], metavar="NAME", help="显式传给测试的进程变量，可重复")
     execution.add_argument("--max-requests", type=int, default=24, help="主任务和子任务共享的请求总上限")
     execution.add_argument("--max-tokens", type=int, default=60000, help="Token 预算；请求前估计，响应后以 usage 校正")
     execution.add_argument("--output-tokens", type=int, default=2048, help="单次模型输出上限")
@@ -191,7 +192,10 @@ def main(argv: list[str] | None = None) -> int:
                     return False
                 target = arguments.get("path", "当前工作区")
                 return input(f"允许 {name} 操作 {target}？输入 yes 确认：").strip().lower() == "yes"
-            policy = Policy(args.allow_write, args.allow_exec, confirm=confirm)
+            for name in args.pass_env:
+                if name.upper().endswith(("_KEY", "_TOKEN", "_SECRET", "_PASSWORD")):
+                    print(f"警告：测试代码可读取显式放行的环境变量 {name}。", file=sys.stderr)
+            policy = Policy(args.allow_write, args.allow_exec, confirm=confirm, pass_env=tuple(args.pass_env))
             plugins = args.plugin
             task = args.message if sid else args.task
 

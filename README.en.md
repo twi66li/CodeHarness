@@ -89,6 +89,8 @@ There is currently no arbitrary shell, no parallel writes and no third-party plu
 
 A model adapter implements `complete(messages, tools, max_tokens, *, timeout=None) -> Reply`, where `timeout` caps the remaining call time. The Chat Completions adapter keeps a string `reasoning_content` returned by the peer for later calls; provider compatibility must be confirmed by real integration. Session traces may contain private code, requirements or model output — never publish the whole database.
 
+Test subprocesses and independent acceptance use an environment allowlist. `run` and `resume` accept `--pass-env NAME` for explicit process variables and warn for sensitive names. Workspace tools filter common private key and credential filenames.
+
 Five consecutive tool calls with identical arguments and results end the session with state `stalled` and CLI exit code 2. Use `trace` to view earlier warnings.
 
 ## Independent evaluation

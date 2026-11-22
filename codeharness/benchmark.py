@@ -16,7 +16,7 @@ from .model_pool import ModelPool
 from .models import ChatModel, Model
 from .runtime import Agent, Limits
 from .store import Store
-from .tools import Policy
+from .tools import Policy, test_subprocess_env
 
 
 def materialize(root: Path, files: dict[str, str]):
@@ -28,7 +28,7 @@ def materialize(root: Path, files: dict[str, str]):
 
 def acceptance(workspace: Path, verifier: Path) -> dict:
     """The verifier is outside the model's workspace. This is not an OS sandbox."""
-    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("CODEHARNESS_", "OPENAI_", "DASHSCOPE_"))}
+    env = test_subprocess_env()
     try:
         process = subprocess.run([sys.executable, "-I", "-B", str(verifier), str(workspace)],
             cwd=workspace, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)

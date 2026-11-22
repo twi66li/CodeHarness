@@ -18,11 +18,25 @@ class ToolError(RuntimeError):
 
 
 HIDDEN = {".git", ".venv", "venv", ".idea", ".codeharness", ".ssh", ".aws", "node_modules", "__pycache__"}
+PRIVATE_FILENAMES = {".netrc", ".pypirc", ".npmrc", ".git-credentials"}
+TEST_ENV_NAMES = {
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR",
+    "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "LANG", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX",
+}
 
 
 def protected(name: str) -> bool:
     name = name.casefold()
-    return name in HIDDEN or name.startswith(".env")
+    return (name in HIDDEN or name in PRIVATE_FILENAMES or name.startswith((".env", "id_rsa", "id_ed25519"))
+            or name.endswith((".pem", ".key", ".p12")))
+
+
+def test_subprocess_env(pass_env: tuple[str, ...] = ()) -> dict[str, str]:
+    env = {name: value for name, value in os.environ.items()
+           if name.upper() in TEST_ENV_NAMES or name.upper().startswith("LC_")}
+    env.update({name: os.environ[name] for name in pass_env if name in os.environ})
+    env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8")
+    return env
 
 
 class Workspace:
@@ -114,11 +128,13 @@ def integer(description: str) -> dict:
 
 
 class Policy:
-    def __init__(self, allow_write=False, allow_exec=False, readonly=False, confirm: Callable | None = None):
+    def __init__(self, allow_write=False, allow_exec=False, readonly=False, confirm: Callable | None = None,
+                 *, pass_env: tuple[str, ...] = ()):
         self.allow_write = allow_write
         self.allow_exec = allow_exec
         self.readonly = readonly
         self.confirm = confirm
+        self.pass_env = pass_env
 
     def authorize(self, tool: Tool, args: dict):
         if tool.effect in {"read", "delegate"}:
@@ -366,12 +382,7 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None):
                 raise ToolError("unittest 的 path 必须是测试目录或 Python 测试文件")
         else:
             command = [sys.executable, "-m", "pytest", str(target), "-q", "-p", "no:cacheprovider"]
-        environment = dict(os.environ)
-        for key in list(environment):
-            if key.upper() in {"OPENAI_API_KEY", "CODEHARNESS_API_KEY", "DASHSCOPE_API_KEY"}:
-                environment.pop(key)
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        environment["PYTHONIOENCODING"] = "utf-8"
+        environment = test_subprocess_env(registry.policy.pass_env)
         test_timeout = timeout()
         process = subprocess.Popen(command, cwd=workspace.root, env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
