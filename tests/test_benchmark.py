@@ -1,4 +1,5 @@
 from contextlib import redirect_stdout
+from hashlib import sha256
 from io import StringIO
 import json
 import os
@@ -39,6 +40,24 @@ class PatchModel:
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_large_tasks_have_deterministic_size_and_long_changed_modules(self):
+        from codeharness.benchmark_large import large_tasks
+
+        def fingerprint(task):
+            return sha256(json.dumps(task.files, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+        workloads = large_tasks()
+        self.assertEqual(len(workloads), 4)
+        self.assertEqual([fingerprint(task) for task in workloads], [fingerprint(task) for task in large_tasks()])
+        for task in workloads:
+            with self.subTest(task=task.id):
+                size = sum(len(text.encode("utf-8")) for text in task.files.values())
+                self.assertTrue(80 <= len(task.files) <= 150)
+                self.assertTrue(300_000 <= size <= 600_000)
+                changed = [name for name in task.reference if task.files.get(name) != task.reference[name]]
+                self.assertTrue(2 <= len(changed) <= 4)
+                self.assertGreaterEqual(sum(800 <= len(task.files[name].splitlines()) <= 1500 for name in changed), 2)
+
     def test_repeat_statistics_uses_only_complete_pairs(self):
         from codeharness.benchmark import repeat_statistics
 
@@ -130,11 +149,13 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(main([
                 "--mode", "model", "--task", "discount", "--model", "glm-5.3",
                 "--env-file", str(env_file), "--allow-exec", "--output-tokens", "4096", "--reasoning-effort", "low",
+                "--context-chars", "8000",
                 "--total-requests", "12", "--total-tokens", "24000",
             ]), 0)
             model.assert_called_once_with("glm-5.3", "https://fixture.invalid/v1", "fake-dashscope-key",
                                           reasoning_effort="low")
             self.assertEqual(run.call_args.kwargs["limits"].output_tokens, 4096)
+            self.assertEqual(run.call_args.kwargs["limits"].context_chars, 8000)
             self.assertNotIn("DASHSCOPE_API_KEY", os.environ)
 
     def test_cli_can_select_single_task_without_running_model(self):

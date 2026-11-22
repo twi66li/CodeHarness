@@ -15,6 +15,7 @@ import time
 import uuid
 
 from .benchmark_tasks import ALL_TASKS, MULTI_TASKS, TASKS, Task
+from .benchmark_large import LARGE_TASK_IDS, large_tasks
 from .cli import load_env, model_connection
 from .model_pool import ModelPool
 from .models import ChatModel, Model
@@ -310,9 +311,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="CodeHarness 独立验收与消融评测")
     parser.add_argument("--mode", choices=("fixtures", "model"), default="fixtures")
     selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--suite", choices=("core", "full", "multi"), default="core",
-                           help="core=5 个基础任务；full=12 个基础任务；multi=3 个 11 文件多模块后端任务")
-    selection.add_argument("--task", choices=tuple(task.id for task in ALL_TASKS), help="仅运行一个指定任务，适合低预算联调")
+    selection.add_argument("--suite", choices=("core", "full", "multi", "large"), default="core",
+                           help="core=5 个基础任务；full=12 个基础任务；multi=3 个多模块任务；large=4 个大仓库任务")
+    selection.add_argument("--task", action="append", choices=tuple(task.id for task in ALL_TASKS) + LARGE_TASK_IDS,
+                           help="仅运行指定任务，可重复指定多个任务")
     parser.add_argument("--variants", choices=("delegate", "no-delegate", "both"), default="delegate")
     parser.add_argument("--repeats", type=int, default=1, help="真实模型评测的重复轮数")
     parser.add_argument("--disable-tool", action="append", default=[], metavar="NAME", help="禁用一个工具，可重复")
@@ -327,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-requests", type=int, default=12)
     parser.add_argument("--max-tokens", type=int, default=24000)
     parser.add_argument("--output-tokens", type=int, default=Limits.output_tokens, help="单次模型输出上限")
+    parser.add_argument("--context-chars", type=int, default=Limits.context_chars, help="压缩上下文的字符阈值")
     parser.add_argument("--max-seconds", type=int, default=180)
     parser.add_argument("--total-requests", type=int)
     parser.add_argument("--total-tokens", type=int)
@@ -354,10 +357,15 @@ def main(argv: list[str] | None = None) -> int:
         output = args.output or Path(".codeharness/benchmarks") / uuid.uuid4().hex[:10]
         variants = ("delegate", "no-delegate") if args.variants == "both" else (args.variants,)
         suite_map = {"core": TASKS[:5], "full": TASKS, "multi": MULTI_TASKS}
-        tasks = tuple(task for task in ALL_TASKS if task.id == args.task) if args.task else suite_map[args.suite]
+        if args.task:
+            candidates = ALL_TASKS + (large_tasks() if set(args.task).intersection(LARGE_TASK_IDS) else ())
+            by_id = {task.id: task for task in candidates}
+            tasks = tuple(by_id[name] for name in dict.fromkeys(args.task))
+        else:
+            tasks = large_tasks() if args.suite == "large" else suite_map[args.suite]
         report = run_suite(tasks, output, model=model,
             limits=Limits(max_requests=args.max_requests, max_tokens=args.max_tokens,
-                          output_tokens=args.output_tokens, max_seconds=args.max_seconds),
+                          output_tokens=args.output_tokens, context_chars=args.context_chars, max_seconds=args.max_seconds),
             variants=variants, total_requests=args.total_requests, total_tokens=args.total_tokens,
             disabled_tools=tuple(args.disable_tool), repeats=args.repeats)
         print(json.dumps({"mode": report["mode"], "report": str(output.resolve() / "report.json"),
