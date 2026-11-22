@@ -36,6 +36,8 @@ jobs:
       # Offline only: unit tests, reference fixtures (full + multi) and the deterministic demo.
       # No model endpoint or credential is configured in CI.
       - name: Offline regression
+        env:
+          PYTHONIOENCODING: utf-8
         run: python -B scripts/regress.py --tag ci
 
       - name: Upload regression logs
