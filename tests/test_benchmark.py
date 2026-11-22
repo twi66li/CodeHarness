@@ -39,6 +39,36 @@ class PatchModel:
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_repeat_statistics_uses_only_complete_pairs(self):
+        from codeharness.benchmark import repeat_statistics
+
+        cases = [
+            {"task": task, "variant": variant, "repeat": repeat, "success": success,
+             "usage": {"requests": repeat, "input_tokens": 5, "output_tokens": 3}, "seconds": float(repeat)}
+            for task, variant, repeat, success in (
+                ("complete", "delegate", 1, True), ("complete", "delegate", 2, True),
+                ("complete", "no-delegate", 1, False), ("complete", "no-delegate", 2, True),
+                ("partial", "delegate", 1, True), ("partial", "no-delegate", 1, False),
+            )
+        ]
+        cases.append({"task": "partial", "variant": "no-delegate", "repeat": 2, "skipped": "total_budget"})
+        stats = repeat_statistics(cases, 2)
+        self.assertEqual(stats["paired"]["tasks"], 1)
+        self.assertEqual(stats["paired"]["success_rate_delta"], 0.5)
+        self.assertEqual(stats["paired"]["bootstrap_95ci"], [0.5, 0.5])
+        self.assertEqual(stats["variants"]["delegate"]["requests"], {"median": 1, "p90": 2})
+        self.assertEqual(repeat_statistics([cases[-1]], 2)["paired"]["tasks"], 0)
+        self.assertIsNone(repeat_statistics([cases[0]], 1)["variants"]["delegate"]["pass_at_1"]["stdev"])
+
+    def test_model_repeats_use_independent_directories_and_record_round_numbers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report = run_suite(TASKS[:1], Path(temp) / "bench", model=TextOnlyModel(),
+                               limits=Limits(max_requests=1, max_tokens=10000), total_requests=2,
+                               total_tokens=20000, repeats=2)
+        self.assertEqual(report["repeats"], 2)
+        self.assertEqual([row["repeat"] for row in report["cases"]], [1, 2])
+        self.assertEqual(len({row["workspace"] for row in report["cases"]}), 2)
+
     def test_benchmark_disables_patch_tool_for_the_actual_case(self):
         offered = set()
 

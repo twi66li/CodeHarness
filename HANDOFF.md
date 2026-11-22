@@ -259,7 +259,7 @@ git worktree remove D:\wt\ch-pre
 | S7 | ☑ | 本地快进合并 `1423aec9a81044c64d9d2b0737b7eeac7e108ad7`。[回归摘要](.codeharness/regress/s7-20261123-001425/summary.json) 100 项中 98 通过、权限与默认关闭的规模测试各跳过 1 项。另以 `CODEHARNESS_SCALE_TESTS=1` 验证 300 轮，库从 8,310,784 降到 2,666,496 字节，S7 早段/末段存储耗时中位数 7.85/6.38 ms，S0 末段 167.65 ms。旧库恢复与四阶段崩溃测试通过。待阶段推送。 |
 | S8 | ☑ | 阶段提交 `6e68c1a656d02285ed9e36fd0df605f058838b11` 已推送。[回归摘要](.codeharness/regress/s8-20261123-001805/summary.json) 103 项中 101 通过、2 项已知跳过，夹具 12/12 + 3/3，demo 8/5。[CI 6/6](https://github.com/twi66li/CodeHarness/actions/runs/45043122878)。Git 未跟踪忽略项会退出列表、搜索和快照；正则优先用 ripgrep，字面搜索保留原有的 Unicode 匹配。 |
 | S9 | ☑ | 本地快进合并 `66babcdd949915177f8fd272e7ff6a9fe5ecca51`。[回归摘要](.codeharness/regress/s9-20261123-002522/summary.json) 108 项中 106 通过、2 项已知跳过；统一 diff 跨文件校验、替换失败回滚及工具消融已通过。待阶段推送。 |
-| S10 | ☐ | |
+| S10 | ☑ | 阶段提交 `bd657a20202372d968788a9e5ee9dcfe8f904c67` 已推送。[回归摘要](.codeharness/regress/s10-20261123-003114/summary.json) 111 项中 109 通过、2 项已知跳过，夹具 12/12 + 3/3，demo 8/5。[CI 6/6](https://github.com/twi66li/CodeHarness/actions/runs/45044367017)。纯只读安全批次并行、主线程按原序写事件；混合批次仍串行，截止时间和崩溃恢复通过。 |
 | S11 | ☐ | |
 | S12 | ☐ | |
 | S13 | ☐ | 各实验的报告目录、模型、n、主要结论 |

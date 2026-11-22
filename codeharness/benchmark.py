@@ -2,9 +2,13 @@
 
 import argparse
 from dataclasses import asdict
+from itertools import product
 import json
+from math import ceil
 import os
 from pathlib import Path
+from random import Random
+from statistics import mean, median, stdev
 import subprocess
 import sys
 import time
@@ -78,6 +82,49 @@ def summarize(cases: list[dict]) -> dict:
     return groups
 
 
+def repeat_statistics(cases: list[dict], repeats: int) -> dict:
+    rows = [row for row in cases if not row.get("skipped")]
+    variants = {}
+    outcomes = {}
+
+    def distribution(values):
+        values = sorted(values)
+        return {"median": median(values) if values else None,
+                "p90": values[ceil(0.9 * len(values)) - 1] if values else None}
+
+    for variant in dict.fromkeys(row["variant"] for row in rows):
+        selected = [row for row in rows if row["variant"] == variant]
+        tasks, rounds = {}, {}
+        for row in selected:
+            task, repeat, success = row["task"], row.get("repeat", 1), bool(row["success"])
+            tasks.setdefault(task, []).append(success)
+            rounds.setdefault(repeat, []).append(success)
+            outcomes[task, variant, repeat] = success
+        pass_at_1 = [mean(rounds[index]) for index in sorted(rounds)]
+        usage = [row["usage"] for row in selected if "usage" in row]
+        variants[variant] = {
+            "task_success_rates": {task: {"success_rate": mean(values), "runs": len(values)} for task, values in tasks.items()},
+            "pass_at_1": {"by_round": {str(index): mean(values) for index, values in sorted(rounds.items())},
+                          "mean": mean(pass_at_1), "stdev": stdev(pass_at_1) if len(pass_at_1) > 1 else None},
+            "requests": distribution(item["requests"] for item in usage),
+            "tokens": distribution(item["input_tokens"] + item["output_tokens"] for item in usage),
+            "seconds": distribution(row["seconds"] for row in selected if "seconds" in row),
+        }
+
+    paired = []
+    for task in sorted({row["task"] for row in rows}):
+        keys = list(product((task,), ("delegate", "no-delegate"), range(1, repeats + 1)))
+        if all(key in outcomes for key in keys):
+            paired.append(mean(outcomes[key] for key in keys[:repeats]) - mean(outcomes[key] for key in keys[repeats:]))
+    interval = None
+    if paired:
+        random = Random(0)
+        samples = sorted(mean(random.choices(paired, k=len(paired))) for _ in range(1000))
+        interval = [samples[24], samples[974]]
+    return {"variants": variants, "paired": {"tasks": len(paired), "pairs": len(paired) * repeats,
+            "success_rate_delta": mean(paired) if paired else None, "bootstrap_95ci": interval}}
+
+
 def diagnostics(store: Store) -> dict:
     """Summarize failure evidence without exporting raw messages or tool output."""
     result = {"model_errors": 0, "model_retries": 0, "tool_errors": 0, "failed_verifications": 0,
@@ -148,16 +195,20 @@ def run_case(task: Task, variant: str, output: Path, directory: Path, model: Mod
 
 def run_suite(tasks: tuple[Task, ...], output: Path, *, model: Model | None = None,
               limits: Limits | None = None, variants: tuple[str, ...] = ("delegate",),
-              total_requests: int | None = None, total_tokens: int | None = None, disabled_tools: tuple[str, ...] = ()) -> dict:
+              total_requests: int | None = None, total_tokens: int | None = None, disabled_tools: tuple[str, ...] = (),
+              repeats: int = 1) -> dict:
     if not tasks:
         raise ValueError("评测任务不能为空")
+    if repeats < 1 or (model is None and repeats != 1):
+        raise ValueError("重复次数必须为正整数，且仅适用于真实模型评测")
     limits = limits or Limits(max_requests=12, max_tokens=24000, max_seconds=180)
     if model is not None:
         if total_requests is None or total_tokens is None or min(total_requests, total_tokens) < 1:
             raise ValueError("真实模型评测必须明确总请求和 Token 预算")
         if not variants or len(set(variants)) != len(variants) or set(variants) - {"delegate", "no-delegate"}:
             raise ValueError("无效的消融选项")
-        if total_requests < limits.max_requests * len(variants) or total_tokens < limits.max_tokens * len(variants):
+        slots = len(variants) * repeats
+        if total_requests < limits.max_requests * slots or total_tokens < limits.max_tokens * slots:
             raise ValueError("总预算不足以完整运行至少一组固定预算的任务")
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -170,6 +221,8 @@ def run_suite(tasks: tuple[Task, ...], output: Path, *, model: Model | None = No
         report["reasoning_effort"] = model.reasoning_effort
     if disabled_tools:
         report["disabled_tools"] = list(disabled_tools)
+    if model is not None:
+        report["repeats"] = repeats
 
     pool = model if isinstance(model, ModelPool) else None
     variants = variants if model is not None else ("reference",)
@@ -197,7 +250,7 @@ def run_suite(tasks: tuple[Task, ...], output: Path, *, model: Model | None = No
             return "total_budget"
         return None
 
-    for task in tasks:
+    for repeat, task in product(range(1, repeats + 1), tasks):
         tried = set()
         while True:
             reason = blocked(len(variants))
@@ -216,7 +269,11 @@ def run_suite(tasks: tuple[Task, ...], output: Path, *, model: Model | None = No
                     row = {"task": task.id, "variant": variant, "skipped": skipped}
                 else:
                     directory = output / task.id / variant
-                    row = run_case(task, variant, output, directory / chosen if chosen else directory, model, limits, disabled_tools)
+                    if repeats > 1:
+                        directory /= f"r{repeat}-{chosen}" if chosen else f"r{repeat}"
+                    elif chosen:
+                        directory /= chosen
+                    row = run_case(task, variant, output, directory, model, limits, disabled_tools)
                     access_denied = row.get("model_access_denied", False)
                     usage = row.get("usage", {})
                     used_requests += usage.get("requests", 0)
@@ -227,6 +284,8 @@ def run_suite(tasks: tuple[Task, ...], output: Path, *, model: Model | None = No
                     row["model"] = chosen
                     if chosen is not None and pool.adapters[chosen].reasoning_effort is not None:
                         row["reasoning_effort"] = pool.adapters[chosen].reasoning_effort
+                if repeats > 1:
+                    row["repeat"] = repeat
                 rows.append(row)
 
             retry_pair = chosen is not None and pool.quota_exhausted
@@ -237,6 +296,13 @@ def run_suite(tasks: tuple[Task, ...], output: Path, *, model: Model | None = No
             save(rows)
             if not retry_pair:
                 break
+    if model is not None:
+        names = report["summary_by_model"] if pool is not None else (model.name,)
+        report["statistics_by_model"] = {
+            name: repeat_statistics([row for row in report["cases"] if row.get("model", model.name) == name], repeats)
+            for name in names}
+        report["statistics_method"] = "pass@1 by round; sample standard deviation; nearest-rank P90; paired bootstrap resamples tasks (seed 0)"
+        (output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return report
 
 
@@ -248,6 +314,7 @@ def main(argv: list[str] | None = None) -> int:
                            help="core=5 个基础任务；full=12 个基础任务；multi=3 个 11 文件多模块后端任务")
     selection.add_argument("--task", choices=tuple(task.id for task in ALL_TASKS), help="仅运行一个指定任务，适合低预算联调")
     parser.add_argument("--variants", choices=("delegate", "no-delegate", "both"), default="delegate")
+    parser.add_argument("--repeats", type=int, default=1, help="真实模型评测的重复轮数")
     parser.add_argument("--disable-tool", action="append", default=[], metavar="NAME", help="禁用一个工具，可重复")
     parser.add_argument("--output", type=Path, help="新建报告目录；默认 .codeharness/benchmarks/<id>")
     parser.add_argument("--env-file", type=Path)
@@ -292,12 +359,12 @@ def main(argv: list[str] | None = None) -> int:
             limits=Limits(max_requests=args.max_requests, max_tokens=args.max_tokens,
                           output_tokens=args.output_tokens, max_seconds=args.max_seconds),
             variants=variants, total_requests=args.total_requests, total_tokens=args.total_tokens,
-            disabled_tools=tuple(args.disable_tool))
+            disabled_tools=tuple(args.disable_tool), repeats=args.repeats)
         print(json.dumps({"mode": report["mode"], "report": str(output.resolve() / "report.json"),
                           "summary": report["summary"]}, ensure_ascii=False, indent=2))
         rows = report["cases"]
         if args.model_pool:
-            rows = {(row["task"], row["variant"]): row for row in rows}.values()
+            rows = {(row["task"], row["variant"], row.get("repeat", 1)): row for row in rows}.values()
         return 0 if all(row.get("success", False) and not row.get("skipped") for row in rows) else 2
     except (ValueError, OSError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
