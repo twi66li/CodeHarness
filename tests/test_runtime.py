@@ -352,6 +352,57 @@ class RuntimeTests(unittest.TestCase):
         latest = [e["data"] for e in self.store.events(sid) if e["kind"] == "model_request"][-1]
         self.assertEqual(latest["estimated_input"], (latest["raw_estimated_input"] * 13 + 9) // 10)
 
+    def test_reopened_trace_reconstructs_model_requests_and_incremental_checkpoints(self):
+        sid = self.store.create(self.root, "fixture")
+        request = {"model": "fixture", "messages": [{"role": "system", "content": "shared context"}], "tools": []}
+        snapshots = [{"a.py": str(index), **({"b.py": "fixed"} if index < 5 else {})} for index in range(23)]
+        for snapshot in snapshots:
+            self.store.append(sid, "model_request", request)
+            self.store.append(sid, "checkpoint", {"files": snapshot})
+        self.store.close()
+        self.store = Store(self.store_path)
+        self.assertEqual(self.store.files_at(sid), snapshots[-1])
+        events = self.store.events(sid)
+        self.assertEqual([e["data"] for e in events if e["kind"] == "model_request"], [request] * 23)
+        self.assertEqual([e["data"]["files"] for e in events if e["kind"] == "checkpoint"], snapshots)
+        raw = self.store.events(sid, expand=False)
+        self.assertEqual(sum("base" in e["data"] for e in raw if e["kind"] == "checkpoint"), 21)
+        self.assertEqual(self.store.usage(sid)["requests"], 23)
+
+    def test_legacy_database_usage_backfills_once_and_stays_shared(self):
+        sid = self.store.create(self.root, "fixture")
+        child = self.store.create(self.root, "fixture", sid)
+        self.store.append(sid, "baseline", {"files": {}})
+        self.store.append(sid, "message", {"role": "system", "content": "legacy system"})
+        with self.store.db:
+            self.store.db.execute("DROP TABLE IF EXISTS usage_totals")
+            for session, kind, data in (
+                (sid, "model_request", {"model": "fixture", "messages": [], "tools": []}),
+                (child, "usage", {"input_tokens": 10, "output_tokens": 2}),
+            ):
+                self.store.db.execute("INSERT INTO events(session_id,time,kind,data) VALUES (?,?,?,?)",
+                                      (session, "2026-01-01T00:00:00+00:00", kind, json.dumps(data)))
+        self.store.close()
+        self.store = Store(self.store_path)
+        self.assertEqual(self.store.usage(child)["input_tokens"], 10)
+        self.store.append(child, "usage", {"input_tokens": 5, "output_tokens": 1, "cached_tokens": 2})
+        self.store.close()
+        self.store = Store(self.store_path)
+        self.assertEqual(self.store.usage(sid), {"requests": 1, "input_tokens": 15, "output_tokens": 3,
+                                                "cached_tokens": 2, "estimated": False})
+        common = ["--store", str(self.store_path), "--json"]
+        with redirect_stdout(StringIO()) as sessions:
+            self.assertEqual(cli(["sessions", *common]), 0)
+        self.assertIn(sid, {row["id"] for row in json.loads(sessions.getvalue())})
+        with redirect_stdout(StringIO()) as trace:
+            self.assertEqual(cli(["trace", sid, *common]), 0)
+        self.assertIn({"model": "fixture", "messages": [], "tools": []},
+                      [event["data"] for event in json.loads(trace.getvalue()) if event["kind"] == "model_request"])
+        with patch("codeharness.cli.ChatModel", return_value=ScriptModel(DemoModel.text("已恢复"))), \
+                redirect_stdout(StringIO()) as output:
+            self.assertEqual(cli(["resume", sid, *common, "--base-url", "https://fixture.invalid/v1"]), 0)
+        self.assertEqual(json.loads(output.getvalue())["usage"]["requests"], 2)
+
     def test_consecutive_identical_reads_warn_then_stall(self):
         (self.root / "a.py").write_text("x = 1", encoding="utf-8")
         model = ScriptModel(*(DemoModel.call("read_file", {"path": "a.py"}) for _ in range(5)))

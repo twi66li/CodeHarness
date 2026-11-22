@@ -255,7 +255,7 @@ git worktree remove D:\wt\ch-pre
 | S3 | ☑ | 本地快进合并 `6bf420e1107b9eb7bdebd9e13a7cbbfbaf5bb023`。[回归摘要](.codeharness/regress/s3-20261122-235546/summary.json)。90 项中 89 通过、1 跳过，已验证重复提示、恢复后计数和停止状态。待阶段推送。 |
 | S4 | ☑ | 阶段提交 `02b6f571b4c73844b98f1a0278ddd154670a72eb` 已推送，S1～S4 均已合入远端 `main`。[回归摘要](.codeharness/regress/s4-20261122-235829/summary.json) 93 项中 92 通过、1 项符号链接权限跳过，夹具 12/12 + 3/3，demo 8/5。[CI 6/6](https://github.com/twi66li/CodeHarness/actions/runs/45041275672)。测试工具和独立验收共用环境白名单。 |
 | S5 | ☑ | 本地快进合并 `e2f10c0f0e90ad6785e62e5013deafb4ac5d2b33`。[回归摘要](.codeharness/regress/s5-20261123-000317/summary.json)。94 项中 93 通过、1 跳过，压缩与新 Skill 的首条 system 保持稳定，旧 Skill 可恢复，报告汇总缓存 Token。待阶段推送。 |
-| S6 | ☐ | |
+| S6 | ☑ | 阶段提交 `e6142bfc21f592689f9e0bcab84e368923dbc037` 已推送。[回归摘要](.codeharness/regress/s6-20261123-000629/summary.json) 97 项中 96 通过、1 项符号链接权限跳过，夹具 12/12 + 3/3，demo 8/5。[CI 6/6](https://github.com/twi66li/CodeHarness/actions/runs/45042040045)。真实估算误差是否低于 15% 留待 S13。 |
 | S7 | ☐ | |
 | S8 | ☐ | |
 | S9 | ☐ | |

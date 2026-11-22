@@ -88,7 +88,7 @@ def diagnostics(store: Store) -> dict:
         if session["parent_id"] is not None:
             result["delegate_calls"] += 1
         estimate = None
-        for event in store.events(session["id"]):
+        for event in store.events(session["id"], expand=False):
             kind, data = event["kind"], event["data"]
             if kind == "model_request":
                 estimate = data.get("estimated_input")

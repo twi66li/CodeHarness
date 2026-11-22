@@ -1,6 +1,7 @@
 """Append-only events are the source of messages, usage and tool evidence."""
 
 from datetime import datetime, timezone
+from hashlib import sha256
 import json
 from pathlib import Path
 import sqlite3
@@ -17,6 +18,8 @@ class Store:
         self.path = path
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
+        self._blob_keys = {}
+        self._heads = {}
         self.db.executescript("""
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS sessions (
@@ -29,10 +32,17 @@ class Store:
                 time TEXT NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS events_session ON events(session_id, id);
+            CREATE INDEX IF NOT EXISTS events_session_kind ON events(session_id, kind, id);
             CREATE TABLE IF NOT EXISTS artifacts (
                 id TEXT PRIMARY KEY, root_id TEXT NOT NULL, content TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS blobs (hash TEXT PRIMARY KEY, content TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS usage_totals (
+                root_id TEXT PRIMARY KEY, requests INTEGER NOT NULL, input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL, cached_tokens INTEGER NOT NULL, estimated INTEGER NOT NULL
+            );
         """)
+        self._backfill_usage()
 
     def close(self):
         self.db.close()
@@ -44,6 +54,7 @@ class Store:
         with self.db:
             self.db.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)",
                             (sid, root, parent_id, str(workspace.resolve()), model, "running", stamp, stamp))
+            self.db.execute("INSERT OR IGNORE INTO usage_totals VALUES (?,0,0,0,0,0)", (root,))
         return sid
 
     def session(self, sid: str) -> dict:
@@ -56,9 +67,90 @@ class Store:
         return [dict(r) for r in self.db.execute("SELECT * FROM sessions ORDER BY created_at DESC")]
 
     def append(self, sid: str, kind: str, data: dict):
+        stored = data
+        blobs = {}
+        if kind == "model_request":
+            stored = dict(data)
+            if "messages" in stored:
+                stored["message_refs"] = [self._blob_ref(message, blobs) for message in stored.pop("messages")]
+            if "tools" in stored:
+                stored["tools_ref"] = self._blob_ref(stored.pop("tools"), blobs)
+        checkpoint = kind == "checkpoint" and "files" in data
         with self.db:
-            self.db.execute("INSERT INTO events(session_id,time,kind,data) VALUES (?,?,?,?)",
-                            (sid, now(), kind, json.dumps(data, ensure_ascii=False)))
+            if checkpoint:
+                self.db.execute("BEGIN IMMEDIATE")
+                stored, depth = self._encode_checkpoint(sid, data["files"])
+            if blobs:
+                self.db.executemany("INSERT OR IGNORE INTO blobs VALUES (?,?)",
+                                    ((key, content) for content, key in blobs.items()))
+            cursor = self.db.execute("INSERT INTO events(session_id,time,kind,data) VALUES (?,?,?,?)",
+                                     (sid, now(), kind, json.dumps(stored, ensure_ascii=False)))
+            if kind in {"model_request", "usage"}:
+                self.db.execute("""UPDATE usage_totals SET requests=requests+?, input_tokens=input_tokens+?,
+                    output_tokens=output_tokens+?, cached_tokens=cached_tokens+?, estimated=estimated OR ?
+                    WHERE root_id=(SELECT root_id FROM sessions WHERE id=?)""", (*self._usage_delta(kind, data), sid))
+        self._blob_keys.update(blobs)
+        if checkpoint:
+            self._heads[sid] = (cursor.lastrowid, depth, dict(data["files"]))
+
+    def _blob_ref(self, value, pending: dict) -> str:
+        content = json.dumps(value, ensure_ascii=False)
+        key = self._blob_keys.get(content) or pending.get(content)
+        if key is None:
+            key = sha256(content.encode("utf-8")).hexdigest()
+            pending[content] = key
+        return key
+
+    def _latest_checkpoint(self, sid: str):
+        return self.db.execute("SELECT id,data FROM events WHERE session_id=? AND kind='checkpoint' ORDER BY id DESC LIMIT 1",
+                               (sid,)).fetchone()
+
+    @staticmethod
+    def _apply_checkpoint(files: dict, delta: dict) -> dict:
+        merged = {**files, **delta["changed"]}
+        for path in delta["removed"]:
+            merged.pop(path, None)
+        return merged
+
+    def _decode_checkpoint(self, sid: str, event_id: int, data: dict) -> tuple[dict, int]:
+        layers = []
+        while "base" in data:
+            layers.append(data)
+            base = data["base"]
+            row = self.db.execute("SELECT data FROM events WHERE session_id=? AND kind='checkpoint' AND id=?",
+                                  (sid, base)).fetchone()
+            if row is None or base >= event_id:
+                raise ValueError("检查点缺少有效的基准")
+            event_id, data = base, json.loads(row["data"])
+        files = data["files"]
+        for delta in reversed(layers):
+            files = self._apply_checkpoint(files, delta)
+        return files, len(layers)
+
+    def _encode_checkpoint(self, sid: str, files: dict) -> tuple[dict, int]:
+        row = self._latest_checkpoint(sid)
+        if row is None:
+            return {"files": files}, 0
+        cached = self._heads.get(sid)
+        if cached and cached[0] == row["id"]:
+            _, depth, previous = cached
+        else:
+            previous, depth = self._decode_checkpoint(sid, row["id"], json.loads(row["data"]))
+        if depth == 19:
+            return {"files": files}, 0
+        return {"base": row["id"], "changed": {name: value for name, value in files.items() if previous.get(name) != value},
+                "removed": sorted(previous.keys() - files.keys())}, depth + 1
+
+    def files_at(self, sid: str) -> dict | None:
+        row = self._latest_checkpoint(sid)
+        if row is None:
+            return None
+        cached = self._heads.get(sid)
+        if cached and cached[0] == row["id"]:
+            return dict(cached[2])
+        files, depth = self._decode_checkpoint(sid, row["id"], json.loads(row["data"]))
+        self._heads[sid] = (row["id"], depth, files)
+        return dict(files)
 
     def status(self, sid: str, status: str):
         with self.db:
@@ -66,17 +158,46 @@ class Store:
             self.db.execute("INSERT INTO events(session_id,time,kind,data) VALUES (?,?,?,?)",
                             (sid, now(), "status", json.dumps({"status": status})))
 
-    def events(self, sid: str) -> list[dict]:
-        return [{"id": r["id"], "time": r["time"], "kind": r["kind"], "data": json.loads(r["data"])}
-                for r in self.db.execute("SELECT * FROM events WHERE session_id=? ORDER BY id", (sid,))]
+    def events(self, sid: str, *, after: int = 0, expand: bool = True) -> list[dict]:
+        events = [{"id": r["id"], "time": r["time"], "kind": r["kind"], "data": json.loads(r["data"])}
+                  for r in self.db.execute("SELECT * FROM events WHERE session_id=? AND id>? ORDER BY id", (sid, after))]
+        if not expand:
+            return events
+        cached_blobs = {}
+        latest = None
+        files = {}
+
+        def read_blob(key):
+            if key not in cached_blobs:
+                row = self.db.execute("SELECT content FROM blobs WHERE hash=?", (key,)).fetchone()
+                if row is None:
+                    raise ValueError("模型记录引用的内容不存在")
+                cached_blobs[key] = row["content"]
+            return json.loads(cached_blobs[key])
+
+        for event in events:
+            data = event["data"]
+            if event["kind"] == "model_request":
+                if "message_refs" in data:
+                    data["messages"] = [read_blob(ref) for ref in data.pop("message_refs")]
+                if "tools_ref" in data:
+                    data["tools"] = read_blob(data.pop("tools_ref"))
+            elif event["kind"] == "checkpoint":
+                if "files" in data:
+                    files = data["files"]
+                elif data["base"] == latest:
+                    files = self._apply_checkpoint(files, data)
+                else:
+                    files, _ = self._decode_checkpoint(sid, event["id"], data)
+                event["data"] = {"files": files}
+                latest = event["id"]
+        return events
 
     def messages(self, sid: str) -> list[dict]:
         messages = []
-        for event in self.events(sid):
-            if event["kind"] == "message":
-                messages.append(event["data"])
-            elif event["kind"] == "skill_injected":
-                messages.append(event["data"]["message"])
+        for row in self.db.execute("SELECT kind,data FROM events WHERE session_id=? AND kind IN ('message','skill_injected') ORDER BY id", (sid,)):
+            data = json.loads(row["data"])
+            messages.append(data if row["kind"] == "message" else data["message"])
         return messages
 
     def artifact(self, sid: str, content: str) -> str:
@@ -93,24 +214,38 @@ class Store:
             raise ValueError("产物不存在或不属于本次任务")
         return row["content"]
 
+    @staticmethod
+    def _usage_delta(kind: str, data: dict) -> tuple:
+        if kind == "model_request":
+            return 1, 0, 0, 0, 0
+        return 0, data.get("input_tokens", 0), data.get("output_tokens", 0), data.get("cached_tokens", 0), bool(data.get("estimated"))
+
+    def _backfill_usage(self):
+        query = "SELECT root_id FROM sessions EXCEPT SELECT root_id FROM usage_totals"
+        if self.db.execute(query).fetchone() is None:
+            return
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            for root, in self.db.execute(query).fetchall():
+                totals = [0, 0, 0, 0, 0]
+                for row in self.db.execute("""SELECT e.kind,e.data FROM events e JOIN sessions s ON s.id=e.session_id
+                        WHERE s.root_id=? AND e.kind IN ('model_request','usage')""", (root,)):
+                    delta = self._usage_delta(row["kind"], json.loads(row["data"]) if row["kind"] == "usage" else {})
+                    for index in range(4):
+                        totals[index] += delta[index]
+                    totals[4] |= delta[4]
+                self.db.execute("INSERT INTO usage_totals VALUES (?,?,?,?,?,?)", (root, *totals))
+
     def usage(self, sid: str) -> dict:
-        rows = self.db.execute("""SELECT e.kind,e.data FROM events e JOIN sessions s ON s.id=e.session_id
-            WHERE s.root_id=? AND e.kind IN ('model_request','usage')""", (self.session(sid)["root_id"],))
-        result = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "estimated": False}
-        for row in rows:
-            if row["kind"] == "model_request":
-                result["requests"] += 1
-            else:
-                data = json.loads(row["data"])
-                result["input_tokens"] += data["input_tokens"]
-                result["output_tokens"] += data["output_tokens"]
-                result["cached_tokens"] += data.get("cached_tokens", 0)
-                result["estimated"] |= data.get("estimated", False)
-        return result
+        row = self.db.execute("""SELECT u.requests,u.input_tokens,u.output_tokens,u.cached_tokens,u.estimated
+            FROM usage_totals u JOIN sessions s ON s.root_id=u.root_id WHERE s.id=?""", (sid,)).fetchone()
+        if row is None:
+            raise ValueError(f"会话不存在：{sid}")
+        return {**dict(row), "estimated": bool(row["estimated"])}
 
     def repair_pending(self, sid: str):
         """Never replay an uncertain side effect after an interrupted process."""
-        events = self.events(sid)
+        events = self.events(sid, expand=False)
         answered = {e["data"]["tool_call_id"] for e in events
                     if e["kind"] == "message" and e["data"]["role"] == "tool"}
         started = {e["data"]["call_id"] for e in events if e["kind"] == "tool_started"}

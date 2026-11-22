@@ -56,6 +56,9 @@ class LoopState:
     recent_tools: list[tuple[str, str | None]] = field(default_factory=list)
     stall_warnings: set[tuple[str, str]] = field(default_factory=set)
     calibrator: Calibrator = field(default_factory=Calibrator)
+    messages: list[dict] = field(default_factory=list)
+    legacy_skills: dict[str, str] = field(default_factory=dict)
+    event_cursor: int = 0
     status: str = "budget_exhausted"
     answer: str = "已达到任务预算。可增加预算后恢复会话。"
 
@@ -157,10 +160,11 @@ class Agent:
             readonly = bool(session["parent_id"])
             sid = session_id
             self.store.repair_pending(sid)
-            events = self.store.events(sid)
-            checkpoints = [e["data"] for e in events if e["kind"] == "checkpoint"]
+            events = self.store.events(sid, expand=False)
             baselines = [e["data"] for e in events if e["kind"] == "baseline"]
-            previous = checkpoints[-1]["files"] if checkpoints else (baselines[0]["files"] if baselines else snapshot)
+            previous = self.store.files_at(sid)
+            if previous is None:
+                previous = baselines[0]["files"] if baselines else snapshot
             changed = sorted(p for p in previous.keys() | snapshot.keys() if previous.get(p) != snapshot.get(p))
             if changed:
                 self.store.append(sid, "message", {"role": "user", "content":
@@ -173,11 +177,11 @@ class Agent:
             self.store.append(sid, "baseline", {"files": snapshot})
         self.store.status(sid, "running")
         self.observe("session", {"id": sid, "readonly": readonly})
-        baseline = next(e["data"]["files"] for e in self.store.events(sid) if e["kind"] == "baseline")
+        baseline = next(e["data"]["files"] for e in self.store.events(sid, expand=False) if e["kind"] == "baseline")
         return sid, readonly, baseline
 
     def _publish_skills(self, sid: str):
-        events = self.store.events(sid)
+        events = self.store.events(sid, expand=False)
         published = {e["data"]["name"] for e in events if e["kind"] == "skill_injected" or
                      (e["kind"] == "skill_loaded" and e["data"].get("delivery") != "message")}
         for event in events:
@@ -196,7 +200,8 @@ class Agent:
         return sha256(packed.encode("utf-8")).hexdigest()
 
     def _restore_detectors(self, state: LoopState):
-        events = self.store.events(state.sid)
+        events = self.store.events(state.sid, expand=False)
+        self._sync_messages(state, events)
         finished = [event["data"] for event in events if event["kind"] == "tool_finished"][-5:]
         legacy_ids = {row["call_id"] for row in finished if "signature" not in row}
         legacy_args = {}
@@ -235,6 +240,19 @@ class Agent:
                 signature = self._tool_signature(row["name"], legacy_args.get(row["call_id"]), outcome)
             state.recent_tools.append((signature, result.get("error")))
 
+    def _sync_messages(self, state: LoopState, events: list[dict] | None = None):
+        if events is None:
+            events = self.store.events(state.sid, after=state.event_cursor, expand=False)
+        for event in events:
+            data = event["data"]
+            if event["kind"] == "message":
+                state.messages.append(data)
+            elif event["kind"] == "skill_injected":
+                state.messages.append(data["message"])
+            elif event["kind"] == "skill_loaded" and data.get("delivery") != "message":
+                state.legacy_skills[data["name"]] = data["instructions"]
+            state.event_cursor = event["id"]
+
     def _can_request(self, state: LoopState, usage: dict) -> bool:
         return usage["requests"] < self.limits.max_requests and (not state.readonly or state.local_requests < 6)
 
@@ -257,12 +275,12 @@ class Agent:
             usage = self.store.usage(sid)
             if not self._can_request(state, usage) or self._timed_out(state):
                 return None
-            messages = self.store.messages(sid)
-            loaded = {e["data"]["name"]: e["data"]["instructions"] for e in self.store.events(sid)
-                      if e["kind"] == "skill_loaded" and e["data"].get("delivery") != "message"}
-            if loaded:
+            self._sync_messages(state)
+            messages = state.messages
+            if state.legacy_skills:
+                messages = list(messages)
                 messages[0] = dict(messages[0])
-                messages[0]["content"] += "\n\n已加载 Skills：\n" + "\n".join(loaded.values())
+                messages[0]["content"] += "\n\n已加载 Skills：\n" + "\n".join(state.legacy_skills.values())
             prepared, compacted = context.prepare(messages)
             schemas = registry.schemas()
             raw_estimate = estimate_json([prepared, schemas])
@@ -440,7 +458,7 @@ class Agent:
         status, answer = state.status, state.answer
         current = self.workspace.snapshot(use_cache=False)
         changes = sorted(p for p in baseline.keys() | current.keys() if baseline.get(p) != current.get(p))
-        checks = [e["data"] for e in self.store.events(sid) if e["kind"] == "verification"]
+        checks = [e["data"] for e in self.store.events(sid, expand=False) if e["kind"] == "verification"]
         verification = "not_run"
         if checks:
             verification = "passed" if checks[-1]["passed"] else "failed"
