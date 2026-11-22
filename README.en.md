@@ -89,6 +89,8 @@ There is currently no arbitrary shell, no parallel writes and no third-party plu
 
 A model adapter implements `complete(messages, tools, max_tokens, *, timeout=None) -> Reply`, where `timeout` caps the remaining call time. The Chat Completions adapter keeps a string `reasoning_content` returned by the peer for later calls; provider compatibility must be confirmed by real integration. Session traces may contain private code, requirements or model output — never publish the whole database.
 
+Five consecutive tool calls with identical arguments and results end the session with state `stalled` and CLI exit code 2. Use `trace` to view earlier warnings.
+
 ## Independent evaluation
 
 Run the 12 basic multi-file cases (`full`) or the 3 eleven-file multi-module backend cases (`multi`) to check that each initial defect fails and the reference fix passes:

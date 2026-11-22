@@ -251,7 +251,7 @@ git worktree remove D:\wt\ch-pre
 | M0 | ☑ | `048750dc119f426389e15be4ff7b4eecc5162711` 已推送。[回归摘要](.codeharness/regress/m0-20261122-234304/summary.json) 中 83 项测试，82 通过、1 项符号链接跳过，夹具 12/12 + 3/3，demo 8/5。[CI 6/6](https://github.com/twi66li/CodeHarness/actions/runs/45039928635)。发起请求前选定模型，额度拒绝通过现有重试回路切换，trace 按物理请求记模型和用量。 |
 | M0 实测 | ☐ | 待确认 `qwen3.8-flash` 和 `deepseek-v4.1-flash-1017` 额度；S1 可使用假模型独立推进。 |
 | S1 | ☑ | 本地快进合并 `707f8496ee9ccd87b8c05427596e76876981d3a2`。[回归摘要](.codeharness/regress/s1-20261122-234735/summary.json)。`Agent.run` 26 行，最长拆出方法 51 行。83 项中 82 通过、1 跳过，夹具和 demo 结果与 S0 一致。待阶段推送。 |
-| S2 | ☐ | |
+| S2 | ☑ | 本地快进合并 `8e51318d8fea9734e1b42615392b57785b8dfb06`。[回归摘要](.codeharness/regress/s2-20261122-235055/summary.json)。86 项中 85 通过、1 跳过，已验证截断恢复、原样记账及旧会话继续执行。待阶段推送。 |
 | S3 | ☐ | |
 | S4 | ☐ | |
 | S5 | ☐ | |

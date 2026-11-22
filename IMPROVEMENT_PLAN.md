@@ -20,7 +20,7 @@
 | S0b | 0 基线 | 改进前真实模型基线（deepseek-v4.1-flash，S0 提交） | S0 | 0.25d | ☑ 两轮 16/16，加冒烟共 381,392 Token |
 | M0 | 0 基线 | 模型池：额度台账与用完自动切换 | S0 | 1d | ☑ `048750d`，离线验收通过，CI 6/6 |
 | S1 | 1 稳定性 | 拆分 `Agent.run`（纯重构） | S0 | 0.5d | ☑ `707f849`，本地回归通过 |
-| S2 | 1 稳定性 | 输出截断可恢复 | S1 | 0.5d | ☐ |
+| S2 | 1 稳定性 | 输出截断可恢复 | S1 | 0.5d | ☑ `8e51318`，本地回归通过 |
 | S3 | 1 稳定性 | 死循环检测与 `stalled` 状态 | S1 | 0.5d | ☐ |
 | S4 | 1 稳定性 | 测试子进程环境白名单与敏感文件保护 | S0 | 0.25d | ☐ |
 | S5 | 2 上下文 | 稳定 system 前缀、Skill 注入方式、记录 `cached_tokens` | S1 | 0.75d | ☐ |
@@ -218,7 +218,7 @@
 - `codeharness/runtime.py`
   - 单独维护 `truncations` 计数，不占用 `model_attempts` 的失败次数。
   - 截断时：按供应商 usage 记账（缺失时按估算保守记账并标记 `estimated`）；写 `model_truncated` 事件 `{"attempt": n, "max_tokens": x}`；追加一条 user 消息：
-    > 上一次回复达到单次输出上限被截断，已丢弃。请把修改拆成多次较小的 edit_file 或 apply_patch 调用，每次只改一处，不要在一次回复中输出整文件。
+    > 上一次回复达到单次输出上限被截断，已丢弃。请使用当前可用的编辑工具分多次修改，每次只改一处。
   - 第一次截断后将本轮 `output_tokens` 提升为 `min(2 × limits.output_tokens, 8192, 剩余预算)`，之后恢复默认值。
   - 新增 `Limits.truncation_retries = 2`；超过后以 `status="error"`、`answer="模型输出连续被截断"` 结束。
 - `codeharness/benchmark.py`：`diagnostics` 增加 `truncations`。

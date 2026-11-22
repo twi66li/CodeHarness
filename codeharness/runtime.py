@@ -1,6 +1,7 @@
 """One execution loop is shared by the main agent and read-only workers."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from hashlib import sha256
 import importlib.util
 import json
 from pathlib import Path
@@ -51,6 +52,8 @@ class LoopState:
     local_requests: int = 0
     failed_attempts: int = 0
     truncations: int = 0
+    recent_tools: list[tuple[str, str | None]] = field(default_factory=list)
+    stall_warnings: set[tuple[str, str]] = field(default_factory=set)
     status: str = "budget_exhausted"
     answer: str = "已达到任务预算。可增加预算后恢复会话。"
 
@@ -123,7 +126,7 @@ class Agent:
         sid, readonly, baseline = self._open_session(task, session_id, parent_id, readonly, context)
         state = LoopState(sid, readonly, deadline)
         if session_id:
-            state.truncations = sum(e["kind"] == "model_truncated" for e in self.store.events(sid))
+            self._restore_detectors(state)
         try:
             registry = self._registry(sid, context, readonly, deadline)
             while (reply := self._next_request(state, registry, context)) is not None:
@@ -169,6 +172,44 @@ class Agent:
         self.observe("session", {"id": sid, "readonly": readonly})
         baseline = next(e["data"]["files"] for e in self.store.events(sid) if e["kind"] == "baseline")
         return sid, readonly, baseline
+
+    @staticmethod
+    def _tool_signature(name: str, args, outcome: dict) -> str:
+        packed = json.dumps([name, args, outcome], ensure_ascii=False, sort_keys=True)
+        return sha256(packed.encode("utf-8")).hexdigest()
+
+    def _restore_detectors(self, state: LoopState):
+        events = self.store.events(state.sid)
+        finished = [event["data"] for event in events if event["kind"] == "tool_finished"][-5:]
+        legacy_ids = {row["call_id"] for row in finished if "signature" not in row}
+        legacy_args = {}
+        for event in events:
+            data = event["data"]
+            if event["kind"] == "model_truncated":
+                state.truncations += 1
+            elif event["kind"] == "tool_stall_warning":
+                state.stall_warnings.add((data["kind"], data["key"]))
+            elif legacy_ids and event["kind"] == "message":
+                for call in data.get("tool_calls", []):
+                    if call["id"] not in legacy_ids:
+                        continue
+                    raw = call["function"]["arguments"]
+                    try:
+                        legacy_args[call["id"]] = json.loads(raw)
+                    except (TypeError, ValueError):
+                        legacy_args[call["id"]] = raw
+        for row in finished:
+            result = row["result"]
+            signature = row.get("signature")
+            if not signature:
+                outcome = {key: value for key, value in result.items() if key != "artifact_id"}
+                if result.get("truncated") and result.get("artifact_id"):
+                    try:
+                        outcome = json.loads(self.store.read_artifact(state.sid, result["artifact_id"]))
+                    except ValueError:
+                        pass
+                signature = self._tool_signature(row["name"], legacy_args.get(row["call_id"]), outcome)
+            state.recent_tools.append((signature, result.get("error")))
 
     def _can_request(self, state: LoopState, usage: dict) -> bool:
         return usage["requests"] < self.limits.max_requests and (not state.readonly or state.local_requests < 6)
@@ -287,6 +328,7 @@ class Agent:
 
     def _execute_calls(self, state: LoopState, registry: Registry, calls: list[dict]) -> bool:
         sid = state.sid
+        warnings = []
         for call in calls:
             if self._timed_out(state):
                 return True
@@ -295,8 +337,9 @@ class Agent:
             self.store.append(sid, "tool_started", {"call_id": cid, "name": name})
             self.observe("tool", {"session_id": sid, "name": name})
             run_tests_snapshot = None
+            args = call["function"]["arguments"]
             try:
-                args = json.loads(call["function"]["arguments"])
+                args = json.loads(args)
                 output = registry.invoke(name, args)
                 full = json.dumps({"ok": True, "output": output}, ensure_ascii=False)
                 aid = self.store.artifact(sid, full)
@@ -317,7 +360,10 @@ class Agent:
                 run_tests_snapshot = self.workspace.snapshot(use_cache=False)
                 self.store.append(sid, "verification", {"passed": False, "files": run_tests_snapshot,
                     "artifact_id": None})
-            self.store.append(sid, "tool_finished", {"call_id": cid, "name": name, "result": result})
+            outcome = json.loads(full) if result["ok"] else result
+            signature = self._tool_signature(name, args, outcome)
+            self.store.append(sid, "tool_finished", {"call_id": cid, "name": name, "result": result,
+                "signature": signature})
             self.store.append(sid, "message", {"role": "tool", "tool_call_id": cid,
                 "content": json.dumps(result, ensure_ascii=False)})
             if tool and tool.effect in {"write", "execute"}:
@@ -329,7 +375,31 @@ class Agent:
                 return True
             if self._timed_out(state):
                 return True
-        return False
+            if self._track_stall(state, signature, result.get("error"), warnings):
+                self.store.repair_pending(sid)
+                state.status, state.answer = "stalled", "工具已连续 5 次返回相同结果，任务已停止。"
+                break
+        for kind, key, message in warnings:
+            self.store.append(sid, "tool_stall_warning", {"kind": kind, "key": key})
+            self.store.append(sid, "message", {"role": "user", "content": message})
+        return state.status == "stalled"
+
+    @staticmethod
+    def _track_stall(state: LoopState, signature: str, error: str | None, warnings: list) -> bool:
+        recent = state.recent_tools
+        recent.append((signature, error))
+        del recent[:-5]
+
+        def warn(kind, key, message):
+            if (kind, key) not in state.stall_warnings:
+                warnings.append((kind, key, message))
+                state.stall_warnings.add((kind, key))
+
+        if len(recent) >= 3 and all(item[0] == signature for item in recent[-3:]):
+            warn("signature", signature, "你已重复相同操作 3 次且结果相同，请换一种方法或说明阻塞原因。")
+        if error and len(recent) >= 4 and all(item[1] == error for item in recent[-4:]):
+            warn("error", error, "工具连续 4 次返回相同错误，请换一种方法或说明阻塞原因。")
+        return len(recent) == 5 and all(item[0] == signature for item in recent)
 
     def _finalize(self, state: LoopState, baseline: dict) -> Result:
         sid = state.sid

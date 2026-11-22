@@ -337,6 +337,53 @@ class RuntimeTests(unittest.TestCase):
         result = json.loads(resumed.getvalue())
         self.assertEqual((result["session_id"], result["status"], result["usage"]["requests"]), (sid, "completed", 3))
 
+    def test_consecutive_identical_reads_warn_then_stall(self):
+        (self.root / "a.py").write_text("x = 1", encoding="utf-8")
+        model = ScriptModel(*(DemoModel.call("read_file", {"path": "a.py"}) for _ in range(5)))
+        result = self.agent(model).run("调查文件")
+        self.assertEqual((result.status, result.usage["requests"]), ("stalled", 5))
+        self.assertIn("重复相同操作 3 次", model.requests[3]["messages"][-1]["content"])
+        warnings = [e for e in self.store.events(result.session_id) if e["kind"] == "tool_stall_warning"]
+        self.assertEqual(len(warnings), 1)
+
+    def test_stall_counter_continues_on_resume_without_duplicate_warning(self):
+        (self.root / "a.py").write_text("x = 1", encoding="utf-8")
+        first = ScriptModel(*(DemoModel.call("read_file", {"path": "a.py"}) for _ in range(3)))
+        initial = self.agent(first, limits=Limits(max_requests=3)).run("调查文件")
+        again = ScriptModel(*(DemoModel.call("read_file", {"path": "a.py"}) for _ in range(2)))
+        resumed = self.agent(again).run("继续调查", session_id=initial.session_id)
+        self.assertEqual((resumed.status, resumed.usage["requests"]), ("stalled", 5))
+        warnings = [e for e in self.store.events(initial.session_id) if e["kind"] == "tool_stall_warning"]
+        self.assertEqual(len(warnings), 1)
+
+    def test_stall_warning_for_identical_errors_from_different_tools(self):
+        model = ScriptModel(
+            DemoModel.call("read_file", {"path": "../private.py"}),
+            DemoModel.call("list_files", {"path": "../private.py"}),
+            DemoModel.call("read_file", {"path": "../private.py"}),
+            DemoModel.call("list_files", {"path": "../private.py"}),
+            DemoModel.text("已定位原因"),
+        )
+        result = self.agent(model).run("调查文件")
+        self.assertEqual(result.status, "completed")
+        self.assertIn("连续 4 次返回相同错误", model.requests[4]["messages"][-1]["content"])
+
+    def test_changed_file_and_intervening_edits_reset_stall_detection(self):
+        path = self.root / "a.py"
+        path.write_text("x = 1", encoding="utf-8")
+
+        def edit(messages, tools):
+            previous = json.loads(messages[-1]["content"])["output"]
+            return DemoModel.call("edit_file", {"path": "a.py", "old_text": "x = 1", "new_text": "x = 2",
+                                                "expected_sha256": previous["sha256"]})
+
+        reads = [DemoModel.call("read_file", {"path": "a.py"}) for _ in range(4)]
+        model = ScriptModel(*reads[:2], edit, *reads[2:], DemoModel.text("完成"))
+        result = self.agent(model).run("修改文件")
+        self.assertEqual(result.status, "unverified")
+        self.assertEqual(path.read_text(encoding="utf-8"), "x = 2")
+        self.assertFalse(any(e["kind"] == "tool_stall_warning" for e in self.store.events(result.session_id)))
+
     def test_failed_tests_are_authoritative_even_when_model_claims_success(self):
         (self.root / "tests").mkdir()
         (self.root / "tests" / "test_failure.py").write_text(
