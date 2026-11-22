@@ -15,6 +15,7 @@ from codeharness.demo import DemoModel, create_demo
 from codeharness.models import ModelError
 from codeharness.runtime import Agent, Limits
 from codeharness.store import Store
+from codeharness.tokens import estimate_json
 from codeharness.tools import Policy, Registry, Tool, ToolError, Workspace, digest, parameters, register_workspace_tools
 
 
@@ -340,6 +341,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((result["session_id"], result["status"], result["usage"]["requests"]), (sid, "completed", 3))
         self.assertEqual(result["usage"]["cached_tokens"], 0)
 
+    def test_token_calibration_is_rebuilt_from_measured_prior_usage(self):
+        sid = self.store.create(self.root, "script-test")
+        self.store.append(sid, "baseline", {"files": {}})
+        self.store.append(sid, "message", {"role": "system", "content": "project rules"})
+        self.store.append(sid, "model_request", {"raw_estimated_input": 100, "estimated_input": 100})
+        self.store.append(sid, "usage", {"input_tokens": 200, "output_tokens": 20})
+        result = self.agent(ScriptModel(DemoModel.text("已恢复"))).run("继续", session_id=sid)
+        self.assertEqual(result.status, "completed")
+        latest = [e["data"] for e in self.store.events(sid) if e["kind"] == "model_request"][-1]
+        self.assertEqual(latest["estimated_input"], (latest["raw_estimated_input"] * 13 + 9) // 10)
+
     def test_consecutive_identical_reads_warn_then_stall(self):
         (self.root / "a.py").write_text("x = 1", encoding="utf-8")
         model = ScriptModel(*(DemoModel.call("read_file", {"path": "a.py"}) for _ in range(5)))
@@ -533,7 +545,7 @@ class RuntimeTests(unittest.TestCase):
         context = Context(self.root, limits.context_chars)
         messages = [{"role": "system", "content": context.system()}, {"role": "user", "content": "检查"}]
         schemas = agent._registry("unused", context, False, 0).schemas()
-        limits.max_tokens = len(json.dumps([messages, schemas], ensure_ascii=False)) // 3 + 1 + 256
+        limits.max_tokens = estimate_json([messages, schemas]) + 256
         with patch("codeharness.runtime.time.sleep") as sleep:
             result = agent.run("检查")
         self.assertEqual(result.status, "budget_exhausted")
@@ -704,6 +716,20 @@ class RuntimeTests(unittest.TestCase):
 
 
 class ContextTests(unittest.TestCase):
+    def test_token_estimate_and_calibrator_are_conservative_and_bounded(self):
+        from codeharness.tokens import Calibrator, estimate
+
+        self.assertEqual((estimate("abcd"), estimate("中英"), estimate("abcde中")), (1, 2, 3))
+        calibration = Calibrator()
+        calibration.observe(100, 200)
+        self.assertEqual(calibration.adjust(100), 130)
+        for _ in range(100):
+            calibration.observe(100, 10000)
+        self.assertLessEqual(calibration.adjust(100), 300)
+        for _ in range(100):
+            calibration.observe(100, 1)
+        self.assertGreaterEqual(calibration.adjust(100), 50)
+
     def test_compaction_preserves_user_constraints_and_tool_pairing(self):
         messages = [{"role": "system", "content": "project rules"},
                     {"role": "user", "content": "不要修改公共接口"}]

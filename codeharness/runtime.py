@@ -12,6 +12,7 @@ from typing import Callable
 from .context import Context
 from .models import Model, ModelError, Reply
 from .store import Store
+from .tokens import Calibrator, estimate_json
 from .tools import Policy, Registry, Tool, ToolError, Workspace, integer, parameters, register_workspace_tools, string
 
 
@@ -54,6 +55,7 @@ class LoopState:
     truncations: int = 0
     recent_tools: list[tuple[str, str | None]] = field(default_factory=list)
     stall_warnings: set[tuple[str, str]] = field(default_factory=set)
+    calibrator: Calibrator = field(default_factory=Calibrator)
     status: str = "budget_exhausted"
     answer: str = "已达到任务预算。可增加预算后恢复会话。"
 
@@ -198,9 +200,16 @@ class Agent:
         finished = [event["data"] for event in events if event["kind"] == "tool_finished"][-5:]
         legacy_ids = {row["call_id"] for row in finished if "signature" not in row}
         legacy_args = {}
+        pending_estimate = None
         for event in events:
             data = event["data"]
-            if event["kind"] == "model_truncated":
+            if event["kind"] == "model_request":
+                pending_estimate = data.get("raw_estimated_input")
+            elif event["kind"] == "usage" and pending_estimate is not None:
+                if not data.get("estimated"):
+                    state.calibrator.observe(pending_estimate, data["input_tokens"])
+                pending_estimate = None
+            elif event["kind"] == "model_truncated":
                 state.truncations += 1
             elif event["kind"] == "tool_stall_warning":
                 state.stall_warnings.add((data["kind"], data["key"]))
@@ -256,7 +265,8 @@ class Agent:
                 messages[0]["content"] += "\n\n已加载 Skills：\n" + "\n".join(loaded.values())
             prepared, compacted = context.prepare(messages)
             schemas = registry.schemas()
-            estimated_input = len(json.dumps([prepared, schemas], ensure_ascii=False)) // 3 + 1
+            raw_estimate = estimate_json([prepared, schemas])
+            estimated_input = state.calibrator.adjust(raw_estimate)
             remaining = self.limits.max_tokens - usage["input_tokens"] - usage["output_tokens"] - estimated_input
             min_output = min(256, self.limits.output_tokens)
             if remaining < min_output:
@@ -269,7 +279,7 @@ class Agent:
             prepare_attempt = getattr(self.model, "prepare_attempt", None)
             if prepare_attempt is not None:
                 previous_model = self.model.name
-                prepare_attempt(estimated_input + output_tokens)
+                prepare_attempt(estimated_input, output_tokens)
                 if self.model.name != previous_model:
                     self.observe("model_switch", {"previous": previous_model, "model": self.model.name})
             seconds_left = state.deadline - time.monotonic()
@@ -278,12 +288,15 @@ class Agent:
             # Each physical model attempt counts towards the shared budget.
             self.store.append(sid, "model_request", {"model": self.model.name,
                 "messages": prepared, "tools": schemas, "max_tokens": output_tokens,
+                "estimated_input": estimated_input, "raw_estimated_input": raw_estimate,
                 "remaining_seconds": seconds_left})
             state.local_requests += 1
             try:
                 reply = self.model.complete(prepared, schemas, output_tokens, timeout=seconds_left)
             except ModelError as exc:
                 if exc.truncated:
+                    if exc.usage is not None:
+                        state.calibrator.observe(raw_estimate, exc.usage[0])
                     if not self._recover_truncation(state, exc, estimated_input, output_tokens):
                         return None
                     if state.truncations == 1:
@@ -293,6 +306,8 @@ class Agent:
                     return None
                 continue
             state.failed_attempts = 0
+            if not reply.estimated:
+                state.calibrator.observe(raw_estimate, reply.input_tokens)
             self.store.append(sid, "usage", {"input_tokens": reply.input_tokens,
                 "output_tokens": reply.output_tokens, "estimated": reply.estimated, "cached_tokens": reply.cached_tokens})
             self.store.append(sid, "message", reply.message)

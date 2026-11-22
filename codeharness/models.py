@@ -9,6 +9,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from .tokens import estimate_json
+
 
 class ModelError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = False, retry_after: float | None = None,
@@ -165,8 +167,8 @@ class ChatModel:
                     })
                 clean["tool_calls"] = cleaned_calls
             estimated = "prompt_tokens" not in usage or "completion_tokens" not in usage
-            input_tokens = int(usage.get("prompt_tokens", len(json.dumps([messages, tools], ensure_ascii=False)) // 3 + 1))
-            output_tokens = int(usage.get("completion_tokens", len(json.dumps(clean, ensure_ascii=False)) // 3 + 1))
+            input_tokens = int(usage["prompt_tokens"]) if "prompt_tokens" in usage else estimate_json([messages, tools])
+            output_tokens = int(usage["completion_tokens"]) if "completion_tokens" in usage else estimate_json(clean)
             if min(input_tokens, output_tokens) < 0:
                 raise ValueError("invalid usage")
             details = usage.get("prompt_tokens_details")

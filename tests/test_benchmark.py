@@ -9,11 +9,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from codeharness.benchmark import acceptance, main, run_suite
+from codeharness.benchmark import acceptance, diagnostics, main, run_suite
 from codeharness.benchmark_tasks import MULTI_TASKS, TASKS
 from codeharness.demo import DemoModel
 from codeharness.models import ModelError
 from codeharness.runtime import Limits
+from codeharness.store import Store
 
 
 class TextOnlyModel:
@@ -38,6 +39,22 @@ class PatchModel:
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_estimate_error_uses_only_measured_pairs_with_estimates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = Store(root / "state.sqlite3")
+            try:
+                sid = store.create(root, "fixture")
+                for request, usage in (({}, {"input_tokens": 1}),
+                                       ({"estimated_input": 90}, {"input_tokens": 100}),
+                                       ({"estimated_input": 120}, {"input_tokens": 100}),
+                                       ({"estimated_input": 500}, {"input_tokens": 1, "estimated": True})):
+                    store.append(sid, "model_request", request)
+                    store.append(sid, "usage", usage)
+                self.assertAlmostEqual(diagnostics(store)["estimate_error"], 0.15)
+            finally:
+                store.close()
+
     def test_report_counts_cached_input_tokens(self):
         class CachedModel(TextOnlyModel):
             def complete(self, *args, **kwargs):

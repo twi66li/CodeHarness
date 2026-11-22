@@ -83,12 +83,21 @@ def diagnostics(store: Store) -> dict:
     result = {"model_errors": 0, "model_retries": 0, "tool_errors": 0, "failed_verifications": 0,
               "delegate_calls": 0, "compactions": 0, "truncations": 0,
               "model_access_denied": False, "tool_error_counts": {}}
+    estimate_errors = []
     for session in store.sessions():
         if session["parent_id"] is not None:
             result["delegate_calls"] += 1
+        estimate = None
         for event in store.events(session["id"]):
             kind, data = event["kind"], event["data"]
-            if kind == "model_error":
+            if kind == "model_request":
+                estimate = data.get("estimated_input")
+            elif kind == "usage" and estimate is not None:
+                actual = data.get("input_tokens", 0)
+                if actual > 0 and not data.get("estimated"):
+                    estimate_errors.append(abs(estimate - actual) / actual)
+                estimate = None
+            elif kind == "model_error":
                 result["model_errors"] += 1
                 result["model_access_denied"] |= bool(data.get("access_denied"))
             elif kind == "model_retry":
@@ -103,6 +112,7 @@ def diagnostics(store: Store) -> dict:
                 result["tool_error_counts"][name] = result["tool_error_counts"].get(name, 0) + 1
             elif kind == "verification" and not data["passed"]:
                 result["failed_verifications"] += 1
+    result["estimate_error"] = sum(estimate_errors) / len(estimate_errors) if estimate_errors else None
     return result
 
 

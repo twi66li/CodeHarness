@@ -10,6 +10,7 @@ import re
 import sys
 
 from .models import ChatModel, ModelError, Reply
+from .tokens import estimate_json
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class ModelPool:
         self.name = self.choose(0) or self.order[0]
         self.switch_mid_session = switch_mid_session
         self.quota_exhausted = False
+        self.prepared_input = None
         self.adapters = {}
         if env is not None:
             url = env.get(settings.get("base_url_env", "DASHSCOPE_BASE_URL"))
@@ -125,18 +127,22 @@ class ModelPool:
                     estimated=any(row.get("estimated", False) for row in rows), kind="imported", source=source,
                     when=datetime.fromtimestamp(report.stat().st_mtime, self.zone))
 
-    def prepare_attempt(self, required: int):
+    def prepare_attempt(self, estimated_input: int, output_tokens: int):
         excluded = () if self.switch_mid_session else set(self.order) - {self.name}
-        name = self.choose(required, excluded=excluded)
+        name = self.choose(estimated_input + output_tokens, excluded=excluded)
         if name is None:
             self.quota_exhausted = True
             balances = ", ".join(f"{row['model']}={row['remaining_tokens']}（{row['expires']}）" for row in self.status())
             raise ModelError(f"模型额度不足：{balances}", quota_exhausted=True, consume_output_budget=False)
         self.name = name
+        self.prepared_input = estimated_input
 
     def complete(self, messages: list[dict], tools: list[dict], max_tokens: int,
                  *, timeout: float | None = None) -> Reply:
-        estimated_input = len(json.dumps([messages, tools], ensure_ascii=False)) // 3 + 1
+        estimated_input = self.prepared_input
+        self.prepared_input = None
+        if estimated_input is None:
+            estimated_input = estimate_json([messages, tools])
         try:
             reply = self.adapters[self.name].complete(messages, tools, max_tokens, timeout=timeout)
         except ModelError as exc:
