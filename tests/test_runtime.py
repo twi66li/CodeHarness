@@ -1,3 +1,5 @@
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -7,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from codeharness.cli import main as cli
 from codeharness.context import Context
 from codeharness.demo import DemoModel, create_demo
 from codeharness.models import ModelError
@@ -279,6 +282,60 @@ class RuntimeTests(unittest.TestCase):
         result = self.agent(model).run("实现功能")
         self.assertEqual(result.status, "unverified")
         self.assertEqual(result.verification, "not_run")
+
+    def test_truncation_discards_reply_and_retries_with_more_output_budget(self):
+        def truncate(messages, tools):
+            raise ModelError("truncated reply", truncated=True, usage=(120, 40))
+
+        (self.root / "tests").mkdir()
+        (self.root / "tests" / "test_ok.py").write_text(
+            "import unittest\nclass T(unittest.TestCase):\n def test_ok(self): self.assertTrue(True)\n", encoding="utf-8")
+        model = ScriptModel(truncate, DemoModel.call("write_file", {"path": "a.py", "content": "pass"}),
+                            DemoModel.call("run_tests", {}), DemoModel.text("完成"))
+        result = self.agent(model, limits=Limits(max_requests=4, model_attempts=1)).run("实现功能")
+        self.assertEqual((result.status, result.usage["requests"]), ("verified", 4))
+        self.assertEqual([r["max_tokens"] for r in model.requests], [2048, 4096, 2048, 2048])
+        self.assertIn("截断", model.requests[1]["messages"][-1]["content"])
+        events = self.store.events(result.session_id)
+        truncated = [e["data"] for e in events if e["kind"] == "model_truncated"]
+        first_usage = next(e["data"] for e in events if e["kind"] == "usage")
+        self.assertEqual(truncated, [{"attempt": 1, "max_tokens": 2048}])
+        self.assertEqual((first_usage["input_tokens"], first_usage["output_tokens"], first_usage["estimated"]),
+                         (120, 40, False))
+
+    def test_repeated_truncation_stops_and_records_each_usage_once(self):
+        def truncate(messages, tools):
+            raise ModelError("truncated reply", truncated=True, usage=(10, 5))
+
+        model = ScriptModel(truncate, truncate, truncate)
+        result = self.agent(model).run("实现功能")
+        self.assertEqual((result.status, result.answer), ("error", "模型输出连续被截断"))
+        self.assertEqual((result.usage["requests"], result.usage["input_tokens"], result.usage["output_tokens"]),
+                         (3, 30, 15))
+
+    def test_legacy_events_can_be_listed_traced_and_resumed_through_truncation(self):
+        sid = self.store.create(self.root, "legacy-model")
+        self.store.append(sid, "baseline", {"files": {}})
+        self.store.append(sid, "message", {"role": "system", "content": "legacy system"})
+        self.store.append(sid, "model_request", {"model": "legacy-model", "messages": [], "tools": [], "max_tokens": 64})
+        self.store.append(sid, "usage", {"input_tokens": 12, "output_tokens": 2})
+        self.store.status(sid, "error")
+        common = ["--store", str(self.store_path), "--json"]
+        with redirect_stdout(StringIO()) as sessions:
+            self.assertEqual(cli(["sessions", *common]), 0)
+        self.assertEqual(json.loads(sessions.getvalue())[0]["id"], sid)
+        with redirect_stdout(StringIO()) as trace:
+            self.assertEqual(cli(["trace", sid, *common]), 0)
+        self.assertTrue(any(e["kind"] == "model_request" for e in json.loads(trace.getvalue())))
+
+        def truncate(messages, tools):
+            raise ModelError("truncated reply", truncated=True, usage=(20, 10))
+
+        model = ScriptModel(truncate, DemoModel.text("已恢复"))
+        with patch("codeharness.cli.ChatModel", return_value=model), redirect_stdout(StringIO()) as resumed:
+            self.assertEqual(cli(["resume", sid, *common, "--base-url", "https://fixture.invalid/v1"]), 0)
+        result = json.loads(resumed.getvalue())
+        self.assertEqual((result["session_id"], result["status"], result["usage"]["requests"]), (sid, "completed", 3))
 
     def test_failed_tests_are_authoritative_even_when_model_claims_success(self):
         (self.root / "tests").mkdir()

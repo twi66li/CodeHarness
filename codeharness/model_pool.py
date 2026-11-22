@@ -141,7 +141,7 @@ class ModelPool:
             reply = self.adapters[self.name].complete(messages, tools, max_tokens, timeout=timeout)
         except ModelError as exc:
             input_tokens, output_tokens = (estimated_input, max_tokens) if exc.consume_output_budget else (0, 0)
-            self.record(self.name, input_tokens, output_tokens, estimated=True)
+            self.record(self.name, *(exc.usage or (input_tokens, output_tokens)), estimated=exc.usage is None)
             code = (exc.code or "").casefold()
             depleted = (exc.status == 403 and (code in self.error_codes
                         or any(part in code for part in ("quota", "freetier", "allocation")))) \

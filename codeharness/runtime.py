@@ -22,12 +22,15 @@ class Limits:
     context_chars: int = 28000
     max_seconds: int = 600
     model_attempts: int = 3
+    truncation_retries: int = 2
 
     def __post_init__(self):
         if min(self.max_requests, self.max_tokens, self.output_tokens, self.max_seconds, self.model_attempts) < 1:
             raise ValueError("预算和超时必须大于 0")
         if self.context_chars < 2000:
             raise ValueError("上下文字符预算不能小于 2000")
+        if self.truncation_retries < 0:
+            raise ValueError("截断重试次数不能为负数")
 
 
 @dataclass
@@ -47,6 +50,7 @@ class LoopState:
     deadline: float
     local_requests: int = 0
     failed_attempts: int = 0
+    truncations: int = 0
     status: str = "budget_exhausted"
     answer: str = "已达到任务预算。可增加预算后恢复会话。"
 
@@ -118,6 +122,8 @@ class Agent:
         context = Context(self.workspace.root, self.limits.context_chars)
         sid, readonly, baseline = self._open_session(task, session_id, parent_id, readonly, context)
         state = LoopState(sid, readonly, deadline)
+        if session_id:
+            state.truncations = sum(e["kind"] == "model_truncated" for e in self.store.events(sid))
         try:
             registry = self._registry(sid, context, readonly, deadline)
             while (reply := self._next_request(state, registry, context)) is not None:
@@ -178,6 +184,7 @@ class Agent:
 
     def _next_request(self, state: LoopState, registry: Registry, context: Context) -> Reply | None:
         sid = state.sid
+        output_cap = self.limits.output_tokens
         while True:
             if self._model_access_error:
                 state.status, state.answer = "error", self._model_access_error
@@ -198,7 +205,8 @@ class Agent:
             min_output = min(256, self.limits.output_tokens)
             if remaining < min_output:
                 return None
-            output_tokens = min(self.limits.output_tokens, remaining)
+            output_tokens = min(output_cap, remaining)
+            output_cap = self.limits.output_tokens
             if compacted:
                 self.store.append(sid, "context_compacted", {"original_messages": len(messages),
                     "sent_messages": len(prepared), "strategy": "keep_user_constraints_and_recent_turns"})
@@ -219,6 +227,12 @@ class Agent:
             try:
                 reply = self.model.complete(prepared, schemas, output_tokens, timeout=seconds_left)
             except ModelError as exc:
+                if exc.truncated:
+                    if not self._recover_truncation(state, exc, estimated_input, output_tokens):
+                        return None
+                    if state.truncations == 1:
+                        output_cap = min(2 * self.limits.output_tokens, 8192)
+                    continue
                 if not self._retry(state, exc, estimated_input, output_tokens, min_output):
                     return None
                 continue
@@ -227,6 +241,21 @@ class Agent:
                 "output_tokens": reply.output_tokens, "estimated": reply.estimated})
             self.store.append(sid, "message", reply.message)
             return None if self._timed_out(state) else reply
+
+    def _recover_truncation(self, state: LoopState, exc: ModelError, estimated_input: int, output_tokens: int) -> bool:
+        state.truncations += 1
+        input_use, output_use = exc.usage or (estimated_input, output_tokens)
+        self.store.append(state.sid, "usage", {"input_tokens": input_use, "output_tokens": output_use,
+            "estimated": exc.usage is None, "failed_attempt": True})
+        self.store.append(state.sid, "model_truncated", {"attempt": state.truncations, "max_tokens": output_tokens})
+        if self._timed_out(state):
+            return False
+        if state.truncations > self.limits.truncation_retries:
+            state.status, state.answer = "error", "模型输出连续被截断"
+            return False
+        self.store.append(state.sid, "message", {"role": "user", "content":
+            "上一次回复达到单次输出上限被截断，已丢弃。请使用当前可用的编辑工具分多次修改，每次只改一处。"})
+        return True
 
     def _retry(self, state: LoopState, exc: ModelError, estimated_input: int, output_tokens: int,
                min_output: int) -> bool:

@@ -250,7 +250,7 @@ git worktree remove D:\wt\ch-pre
 | S0b | ☑ | 在 `1a912f5` 使用 `deepseek-v4.1-flash` 默认推理强度。[冒烟](.codeharness/benchmarks/pre-ds-smoke/report.json) 1/1、10,570 Token。[core r1](.codeharness/benchmarks/pre-ds-core-r1/report.json) 5/5、82,107 Token。[multi r1](.codeharness/benchmarks/pre-ds-multi-r1/report.json) 3/3、102,124 Token。[core r2](.codeharness/benchmarks/pre-ds-core-r2/report.json) 5/5、77,937 Token。[multi r2](.codeharness/benchmarks/pre-ds-multi-r2/report.json) 先完成 1 题、36,506 Token。用户批准把 S0b 上限提高到 400K 后，只补跑了 [rbac-gateway](.codeharness/benchmarks/pre-ds-multi-r2-rbac-gateway/report.json) 和 [ledger-reconcile](.codeharness/benchmarks/pre-ds-multi-r2-ledger-reconcile/report.json)，独立验收均通过，分别用了 35,895 和 36,253 Token。两轮共 16/16，加冒烟共 111 次请求、381,392 Token，无模型错误或访问拒绝，委派 0 次，压缩 1 次。 |
 | M0 | ☑ | `048750dc119f426389e15be4ff7b4eecc5162711` 已推送。[回归摘要](.codeharness/regress/m0-20261122-234304/summary.json) 中 83 项测试，82 通过、1 项符号链接跳过，夹具 12/12 + 3/3，demo 8/5。[CI 6/6](https://github.com/twi66li/CodeHarness/actions/runs/45039928635)。发起请求前选定模型，额度拒绝通过现有重试回路切换，trace 按物理请求记模型和用量。 |
 | M0 实测 | ☐ | 待确认 `qwen3.8-flash` 和 `deepseek-v4.1-flash-1017` 额度；S1 可使用假模型独立推进。 |
-| S1 | ☐ | |
+| S1 | ☑ | 本地快进合并 `707f8496ee9ccd87b8c05427596e76876981d3a2`。[回归摘要](.codeharness/regress/s1-20261122-234735/summary.json)。`Agent.run` 26 行，最长拆出方法 51 行。83 项中 82 通过、1 跳过，夹具和 demo 结果与 S0 一致。待阶段推送。 |
 | S2 | ☐ | |
 | S3 | ☐ | |
 | S4 | ☐ | |

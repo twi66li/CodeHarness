@@ -56,7 +56,7 @@ def summarize(cases: list[dict]) -> dict:
         group = groups.setdefault(row["variant"], {"attempted": 0, "passed": 0, "failed": 0, "skipped": 0,
             "requests": 0, "input_tokens": 0, "output_tokens": 0, "usage_estimated": False, "seconds": 0.0,
             "model_errors": 0, "model_retries": 0, "tool_errors": 0, "failed_verifications": 0,
-            "delegate_calls": 0, "compactions": 0})
+            "delegate_calls": 0, "compactions": 0, "truncations": 0})
         if row.get("skipped"):
             group["skipped"] += 1
         else:
@@ -66,7 +66,7 @@ def summarize(cases: list[dict]) -> dict:
             group[key] += row.get("usage", {}).get(key, 0)
         group["usage_estimated"] |= row.get("usage", {}).get("estimated", False)
         for key in ("model_errors", "model_retries", "tool_errors", "failed_verifications",
-                    "delegate_calls", "compactions"):
+                    "delegate_calls", "compactions", "truncations"):
             group[key] += row.get("diagnostics", {}).get(key, 0)
         group["seconds"] += row.get("seconds", 0.0)
     for group in groups.values():
@@ -78,7 +78,8 @@ def summarize(cases: list[dict]) -> dict:
 def diagnostics(store: Store) -> dict:
     """Summarize failure evidence without exporting raw messages or tool output."""
     result = {"model_errors": 0, "model_retries": 0, "tool_errors": 0, "failed_verifications": 0,
-              "delegate_calls": 0, "compactions": 0, "model_access_denied": False, "tool_error_counts": {}}
+              "delegate_calls": 0, "compactions": 0, "truncations": 0,
+              "model_access_denied": False, "tool_error_counts": {}}
     for session in store.sessions():
         if session["parent_id"] is not None:
             result["delegate_calls"] += 1
@@ -89,6 +90,8 @@ def diagnostics(store: Store) -> dict:
                 result["model_access_denied"] |= bool(data.get("access_denied"))
             elif kind == "model_retry":
                 result["model_retries"] += 1
+            elif kind == "model_truncated":
+                result["truncations"] += 1
             elif kind == "context_compacted":
                 result["compactions"] += 1
             elif kind == "tool_finished" and not data["result"].get("ok"):

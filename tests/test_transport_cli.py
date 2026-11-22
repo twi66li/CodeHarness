@@ -144,8 +144,10 @@ class TransportTests(unittest.TestCase):
         def respond(path, headers, payload):
             return 200, completion(DemoModel.call("write_file", {"path": "x.py"}).message, "length")
         with server_for(respond) as base:
-            with self.assertRaisesRegex(ModelError, "不完整"):
+            with self.assertRaisesRegex(ModelError, "不完整") as caught:
                 ChatModel("model", base, "fake").complete([], [], 100)
+        self.assertTrue(caught.exception.truncated)
+        self.assertEqual(caught.exception.usage, (123, 45))
 
     def test_duplicate_tool_ids_rejected(self):
         message = DemoModel.call("list_files", {}).message

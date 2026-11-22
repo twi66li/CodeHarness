@@ -13,7 +13,8 @@ from urllib.request import Request, urlopen
 class ModelError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = False, retry_after: float | None = None,
                  access_denied: bool = False, consume_output_budget: bool = True,
-                 status: int | None = None, code: str | None = None, quota_exhausted: bool = False):
+                 status: int | None = None, code: str | None = None, quota_exhausted: bool = False,
+                 truncated: bool = False, usage: tuple[int, int] | None = None):
         super().__init__(message)
         self.retryable = retryable
         self.retry_after = retry_after
@@ -22,6 +23,8 @@ class ModelError(RuntimeError):
         self.status = status
         self.code = code
         self.quota_exhausted = quota_exhausted
+        self.truncated = truncated
+        self.usage = usage
 
 
 def safe_error_tag(body: bytes, api_key: str) -> str:
@@ -125,8 +128,17 @@ class ChatModel:
             raise ModelError("模型接口返回了无效 JSON") from None
         try:
             choice = data["choices"][0]
+            usage = data.get("usage") or {}
             if choice.get("finish_reason") == "length":
-                raise ModelError("模型输出达到单次上限，未接受不完整的回答或工具调用")
+                counts = None
+                try:
+                    input_use, output_use = int(usage["prompt_tokens"]), int(usage["completion_tokens"])
+                    if min(input_use, output_use) >= 0:
+                        counts = (input_use, output_use)
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    pass
+                raise ModelError("模型输出达到单次上限，未接受不完整的回答或工具调用",
+                                 truncated=True, usage=counts)
             message = choice["message"]
             clean = {"role": "assistant", "content": message.get("content") or ""}
             if not isinstance(clean["content"], str):
@@ -151,7 +163,6 @@ class ChatModel:
                         "function": {"name": fn["name"], "arguments": fn["arguments"]},
                     })
                 clean["tool_calls"] = cleaned_calls
-            usage = data.get("usage") or {}
             estimated = "prompt_tokens" not in usage or "completion_tokens" not in usage
             input_tokens = int(usage.get("prompt_tokens", len(json.dumps([messages, tools], ensure_ascii=False)) // 3 + 1))
             output_tokens = int(usage.get("completion_tokens", len(json.dumps(clean, ensure_ascii=False)) // 3 + 1))
