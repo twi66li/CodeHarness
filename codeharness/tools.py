@@ -250,6 +250,7 @@ class Tool:
     parameters: dict
     execute: Callable
     effect: str = "read"
+    parallel_safe: bool = False
 
     def schema(self) -> dict:
         return {"type": "function", "function": {"name": self.name,
@@ -636,3 +637,6 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None):
         path_parameter = parameters({"path": string("相对目录或文件")})
         registry.register(Tool("git_status", "只读列出 Git 工作区改动，不包含受保护路径。", path_parameter, git_status))
         registry.register(Tool("git_diff", "只读查看相对 HEAD 的已跟踪文件差异，不包含受保护路径。", path_parameter, git_diff))
+    for name in ("list_files", "read_file", "search", "check_syntax", "git_status", "git_diff"):
+        if name in registry.tools:
+            registry.tools[name].parallel_safe = True

@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from threading import Barrier
+import time
 import unittest
 from unittest.mock import patch
 
@@ -685,6 +687,41 @@ class RuntimeTests(unittest.TestCase):
         result = self.agent(model).run("只读检查")
         checkpoints = [e for e in self.store.events(result.session_id) if e["kind"] == "checkpoint"]
         self.assertEqual(len(checkpoints), 1)
+
+    def test_parallel_reads_overlap_and_are_recorded_in_model_call_order(self):
+        batch = DemoModel.call("read_file", {"path": "slow.py"})
+        batch.message["tool_calls"].extend(DemoModel.call("read_file", {"path": "fast.py"}).message["tool_calls"])
+        agent = self.agent(ScriptModel(batch, DemoModel.text("完成")))
+        create_registry = agent._registry
+        barrier = Barrier(2, timeout=1)
+        finished = []
+
+        def read(path):
+            barrier.wait()
+            time.sleep(0.04 if path == "slow.py" else 0.01)
+            finished.append(path)
+            return {"path": path}
+
+        def with_slow_read(*args):
+            registry = create_registry(*args)
+            registry.tools["read_file"].execute = read
+            return registry
+
+        with patch.object(agent, "_registry", side_effect=with_slow_read):
+            result = agent.run("读取两个文件")
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(finished, ["fast.py", "slow.py"])
+        events = [e for e in self.store.events(result.session_id) if e["kind"] in {"tool_started", "tool_finished"}]
+        self.assertEqual([e["kind"] for e in events], ["tool_started"] * 2 + ["tool_finished"] * 2)
+        self.assertEqual([e["data"]["result"]["output"]["path"] for e in events[2:]], ["slow.py", "fast.py"])
+
+    def test_mixed_write_and_read_in_a_batch_remain_serial(self):
+        batch = DemoModel.call("write_file", {"path": "new.py", "content": "made = True"})
+        batch.message["tool_calls"].extend(DemoModel.call("read_file", {"path": "new.py"}).message["tool_calls"])
+        result = self.agent(ScriptModel(batch, DemoModel.text("完成"))).run("先写再读")
+        events = [e for e in self.store.events(result.session_id) if e["kind"] in {"tool_started", "tool_finished"}]
+        self.assertEqual([e["kind"] for e in events], ["tool_started", "tool_finished"] * 2)
+        self.assertIn("made = True", events[-1]["data"]["result"]["output"]["content"])
 
     def test_repair_pending_distinguishes_unstarted_and_interrupted_calls(self):
         sid = self.store.create(self.root, "script-test")

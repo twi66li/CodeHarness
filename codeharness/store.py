@@ -248,7 +248,7 @@ class Store:
         events = self.events(sid, expand=False)
         answered = {e["data"]["tool_call_id"] for e in events
                     if e["kind"] == "message" and e["data"]["role"] == "tool"}
-        started = {e["data"]["call_id"] for e in events if e["kind"] == "tool_started"}
+        started = {e["data"]["call_id"]: e["data"].get("effect") for e in events if e["kind"] == "tool_started"}
         finished = {e["data"]["call_id"]: e["data"]["result"] for e in events if e["kind"] == "tool_finished"}
         for event in events:
             if event["kind"] != "message":
@@ -259,6 +259,8 @@ class Store:
                     continue
                 if cid in finished:
                     result = finished[cid]
+                elif started.get(cid) == "read":
+                    result = {"ok": False, "error": "只读工具调用被中断，可以安全地重新执行。"}
                 elif cid in started:
                     result = {"ok": False, "error":
                         "执行被中断，工具是否产生副作用尚不确定。先检查文件或测试状态，不要直接重复写操作。"}

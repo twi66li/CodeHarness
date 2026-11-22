@@ -1,5 +1,6 @@
 """One execution loop is shared by the main agent and read-only workers."""
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from hashlib import sha256
 import importlib.util
@@ -387,19 +388,81 @@ class Agent:
         sid = state.sid
         warnings = []
         loaded_skill = False
-        for call in calls:
-            if self._timed_out(state):
+        parallel = len(calls) > 1 and not (registry.before or registry.after) and all(
+            (tool := registry.tools.get(call["function"]["name"])) is not None
+            and tool.effect == "read" and tool.parallel_safe for call in calls)
+        outcomes = []
+        if parallel:
+            scheduled = []
+            for call in calls:
+                if self._timed_out(state):
+                    break
+                self._start_call(sid, registry, call)
+                scheduled.append(call)
+            calls = scheduled
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                outcomes = list(executor.map(lambda call: self._invoke_call(registry, call), calls))
+
+        for index, call in enumerate(calls):
+            if parallel:
+                args, outcome = outcomes[index]
+            else:
+                if self._timed_out(state):
+                    return True
+                self._start_call(sid, registry, call)
+                args, outcome = self._invoke_call(registry, call)
+            signature, result = self._record_call(state, registry, call, args, outcome)
+            loaded_skill |= call["function"]["name"] == "load_skill" and result["ok"]
+            if self._model_access_error:
+                state.status, state.answer = "error", self._model_access_error
                 return True
-            name, cid = call["function"]["name"], call["id"]
-            tool = registry.tools.get(name)
-            self.store.append(sid, "tool_started", {"call_id": cid, "name": name})
-            self.observe("tool", {"session_id": sid, "name": name})
-            run_tests_snapshot = None
-            args = call["function"]["arguments"]
+            if self._timed_out(state):
+                if parallel:
+                    continue
+                return True
+            if self._track_stall(state, signature, result.get("error"), warnings):
+                state.status, state.answer = "stalled", "工具已连续 5 次返回相同结果，任务已停止。"
+                if not parallel:
+                    self.store.repair_pending(sid)
+                    break
+        for kind, key, message in warnings:
+            self.store.append(sid, "tool_stall_warning", {"kind": kind, "key": key})
+            self.store.append(sid, "message", {"role": "user", "content": message})
+        if loaded_skill:
+            self._publish_skills(sid)
+        return state.status in {"stalled", "timeout"}
+
+    def _start_call(self, sid: str, registry: Registry, call: dict):
+        name = call["function"]["name"]
+        tool = registry.tools.get(name)
+        self.store.append(sid, "tool_started", {"call_id": call["id"], "name": name,
+            "effect": tool.effect if tool is not None else None})
+        self.observe("tool", {"session_id": sid, "name": name})
+
+    @staticmethod
+    def _tool_failure(exc: Exception) -> dict:
+        expected = isinstance(exc, (ToolError, ValueError, TypeError, OSError, subprocess.TimeoutExpired))
+        message = str(exc) if expected else f"{type(exc).__name__}: {exc}"
+        return {"ok": False, "error": message[:1000]}
+
+    def _invoke_call(self, registry: Registry, call: dict) -> tuple:
+        args = call["function"]["arguments"]
+        try:
+            args = json.loads(args)
+            return args, {"ok": True, "output": registry.invoke(call["function"]["name"], args)}
+        except Exception as exc:
+            return args, self._tool_failure(exc)
+
+    def _record_call(self, state: LoopState, registry: Registry, call: dict, args, outcome: dict) -> tuple:
+        sid = state.sid
+        name, cid = call["function"]["name"], call["id"]
+        tool = registry.tools.get(name)
+        run_tests_snapshot = None
+        result = outcome
+        if outcome["ok"]:
             try:
-                args = json.loads(args)
-                output = registry.invoke(name, args)
-                full = json.dumps({"ok": True, "output": output}, ensure_ascii=False)
+                output = outcome["output"]
+                full = json.dumps(outcome, ensure_ascii=False)
                 aid = self.store.artifact(sid, full)
                 result = {"ok": True, "artifact_id": aid}
                 if len(full) > 6500:
@@ -410,40 +473,19 @@ class Agent:
                     run_tests_snapshot = self.workspace.snapshot(use_cache=False)
                     self.store.append(sid, "verification", {"passed": output["passed"],
                         "files": run_tests_snapshot, "artifact_id": aid})
-            except (ToolError, ValueError, TypeError, OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
-                result = {"ok": False, "error": str(exc)[:1000]}
             except Exception as exc:
-                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:1000]}
-            if name == "run_tests" and tool and not result["ok"]:
-                run_tests_snapshot = self.workspace.snapshot(use_cache=False)
-                self.store.append(sid, "verification", {"passed": False, "files": run_tests_snapshot,
-                    "artifact_id": None})
-            outcome = json.loads(full) if result["ok"] else result
-            loaded_skill |= name == "load_skill" and result["ok"]
-            signature = self._tool_signature(name, args, outcome)
-            self.store.append(sid, "tool_finished", {"call_id": cid, "name": name, "result": result,
-                "signature": signature})
-            self.store.append(sid, "message", {"role": "tool", "tool_call_id": cid,
-                "content": json.dumps(result, ensure_ascii=False)})
-            if tool and tool.effect in {"write", "execute"}:
-                snap = run_tests_snapshot if run_tests_snapshot is not None else self.workspace.snapshot(
-                    use_cache=(tool.effect == "write"))
-                self._save_snapshot(sid, "checkpoint", snap)
-            if self._model_access_error:
-                state.status, state.answer = "error", self._model_access_error
-                return True
-            if self._timed_out(state):
-                return True
-            if self._track_stall(state, signature, result.get("error"), warnings):
-                self.store.repair_pending(sid)
-                state.status, state.answer = "stalled", "工具已连续 5 次返回相同结果，任务已停止。"
-                break
-        for kind, key, message in warnings:
-            self.store.append(sid, "tool_stall_warning", {"kind": kind, "key": key})
-            self.store.append(sid, "message", {"role": "user", "content": message})
-        if loaded_skill:
-            self._publish_skills(sid)
-        return state.status == "stalled"
+                result = self._tool_failure(exc)
+        if name == "run_tests" and tool and not result["ok"]:
+            run_tests_snapshot = self.workspace.snapshot(use_cache=False)
+            self.store.append(sid, "verification", {"passed": False, "files": run_tests_snapshot, "artifact_id": None})
+        signature = self._tool_signature(name, args, json.loads(full) if result["ok"] else result)
+        self.store.append(sid, "tool_finished", {"call_id": cid, "name": name, "result": result, "signature": signature})
+        self.store.append(sid, "message", {"role": "tool", "tool_call_id": cid,
+            "content": json.dumps(result, ensure_ascii=False)})
+        if tool and tool.effect in {"write", "execute"}:
+            files = run_tests_snapshot if run_tests_snapshot is not None else self.workspace.snapshot(use_cache=(tool.effect == "write"))
+            self._save_snapshot(sid, "checkpoint", files)
+        return signature, result
 
     @staticmethod
     def _track_stall(state: LoopState, signature: str, error: str | None, warnings: list) -> bool:

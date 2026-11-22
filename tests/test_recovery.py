@@ -42,6 +42,31 @@ if stage >= 3:
 os._exit(19)
 """
 
+PARALLEL_CRASH = r"""
+import os, sys
+from pathlib import Path
+from codeharness.demo import DemoModel
+from codeharness.runtime import Agent
+from codeharness.store import Store
+
+class CrashStore(Store):
+    def append(self, sid, kind, data):
+        super().append(sid, kind, data)
+        if kind == 'tool_finished':
+            os._exit(29)
+
+class ParallelModel:
+    name = 'fixture'
+
+    def complete(self, messages, tools, max_tokens, *, timeout=None):
+        result = DemoModel.call('read_file', {'path': 'a.txt'})
+        result.message['tool_calls'] += DemoModel.call('read_file', {'path': 'b.txt'}).message['tool_calls']
+        return result
+
+root = Path(sys.argv[1])
+Agent(ParallelModel(), root, CrashStore(Path(sys.argv[2]))).run('Read both files')
+"""
+
 
 class RecoveryModel:
     name = "recovery-test-double"
@@ -51,6 +76,30 @@ class RecoveryModel:
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_parallel_read_crash_recovers_recorded_and_uncertain_results(self):
+        project = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            for name in ("a.txt", "b.txt"):
+                (root / name).write_text("fixture", encoding="utf-8")
+            db = Path(temp) / "state.sqlite3"
+            process = subprocess.run([sys.executable, "-B", "-c", PARALLEL_CRASH, str(root), str(db)],
+                                     cwd=project, capture_output=True, timeout=15)
+            self.assertEqual(process.returncode, 29, process.stderr)
+            store = Store(db)
+            try:
+                sid = store.sessions()[0]["id"]
+                result = Agent(RecoveryModel(), root, store).run("继续", session_id=sid)
+                messages = [json.loads(m["content"]) for m in store.messages(sid) if m["role"] == "tool"]
+                self.assertEqual(result.status, "completed")
+                self.assertEqual(len(messages), 2)
+                self.assertTrue(messages[0]["ok"])
+                self.assertIn("安全地重新执行", messages[1]["error"])
+                self.assertEqual(sum(e["kind"] == "tool_started" for e in store.events(sid)), 2)
+            finally:
+                store.close()
+
     def test_recover_real_process_crashes_at_tool_boundaries(self):
         project = Path(__file__).resolve().parents[1]
         for stage in range(4):
