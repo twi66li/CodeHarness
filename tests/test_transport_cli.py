@@ -59,11 +59,14 @@ class TransportTests(unittest.TestCase):
     def test_mock_transport_preserves_reasoning_and_remaining_timeout(self):
         message = DemoModel.call("list_files", {}).message
         message["reasoning_content"] = "fixture reasoning"
-        wire = json.dumps(completion(message, "tool_calls")).encode("utf-8")
+        data = completion(message, "tool_calls")
+        data["usage"]["prompt_tokens_details"] = {"cached_tokens": 42}
+        wire = json.dumps(data).encode("utf-8")
         with patch("codeharness.models.urlopen", return_value=BytesIO(wire)) as opener:
             model = ChatModel("test", "https://fixture.invalid/v1", "FAKE_TEST_CREDENTIAL")
             reply = model.complete([{"role": "user", "content": "检查"}], [], 100, timeout=7)
         self.assertEqual(reply.message, message)
+        self.assertEqual(reply.cached_tokens, 42)
         self.assertEqual(opener.call_args.kwargs["timeout"], 7)
         next_wire = json.dumps(completion({"role": "assistant", "content": "done"})).encode("utf-8")
         with patch("codeharness.models.urlopen", return_value=BytesIO(next_wire)) as opener:

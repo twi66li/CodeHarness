@@ -71,7 +71,13 @@ class Store:
                 for r in self.db.execute("SELECT * FROM events WHERE session_id=? ORDER BY id", (sid,))]
 
     def messages(self, sid: str) -> list[dict]:
-        return [e["data"] for e in self.events(sid) if e["kind"] == "message"]
+        messages = []
+        for event in self.events(sid):
+            if event["kind"] == "message":
+                messages.append(event["data"])
+            elif event["kind"] == "skill_injected":
+                messages.append(event["data"]["message"])
+        return messages
 
     def artifact(self, sid: str, content: str) -> str:
         aid = uuid.uuid4().hex[:12]
@@ -90,7 +96,7 @@ class Store:
     def usage(self, sid: str) -> dict:
         rows = self.db.execute("""SELECT e.kind,e.data FROM events e JOIN sessions s ON s.id=e.session_id
             WHERE s.root_id=? AND e.kind IN ('model_request','usage')""", (self.session(sid)["root_id"],))
-        result = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "estimated": False}
+        result = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "estimated": False}
         for row in rows:
             if row["kind"] == "model_request":
                 result["requests"] += 1
@@ -98,6 +104,7 @@ class Store:
                 data = json.loads(row["data"])
                 result["input_tokens"] += data["input_tokens"]
                 result["output_tokens"] += data["output_tokens"]
+                result["cached_tokens"] += data.get("cached_tokens", 0)
                 result["estimated"] |= data.get("estimated", False)
         return result
 

@@ -317,6 +317,7 @@ class RuntimeTests(unittest.TestCase):
         sid = self.store.create(self.root, "legacy-model")
         self.store.append(sid, "baseline", {"files": {}})
         self.store.append(sid, "message", {"role": "system", "content": "legacy system"})
+        self.store.append(sid, "skill_loaded", {"name": "old", "instructions": "legacy skill body"})
         self.store.append(sid, "model_request", {"model": "legacy-model", "messages": [], "tools": [], "max_tokens": 64})
         self.store.append(sid, "usage", {"input_tokens": 12, "output_tokens": 2})
         self.store.status(sid, "error")
@@ -329,6 +330,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(any(e["kind"] == "model_request" for e in json.loads(trace.getvalue())))
 
         def truncate(messages, tools):
+            self.assertIn("legacy skill body", messages[0]["content"])
             raise ModelError("truncated reply", truncated=True, usage=(20, 10))
 
         model = ScriptModel(truncate, DemoModel.text("已恢复"))
@@ -336,6 +338,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(cli(["resume", sid, *common, "--base-url", "https://fixture.invalid/v1"]), 0)
         result = json.loads(resumed.getvalue())
         self.assertEqual((result["session_id"], result["status"], result["usage"]["requests"]), (sid, "completed", 3))
+        self.assertEqual(result["usage"]["cached_tokens"], 0)
 
     def test_consecutive_identical_reads_warn_then_stall(self):
         (self.root / "a.py").write_text("x = 1", encoding="utf-8")
@@ -584,14 +587,20 @@ class RuntimeTests(unittest.TestCase):
         directory.mkdir(parents=True)
         (directory / "SKILL.md").write_bytes(
             "\ufeff---\ndescription: 验证方法\n---\nUNIQUE_SKILL_BODY".encode("utf-8"))
+        systems = []
+
         def first(messages, tools):
             self.assertNotIn("UNIQUE_SKILL_BODY", messages[0]["content"])
             self.assertIn("验证方法", messages[0]["content"])
-            return DemoModel.call("load_skill", {"name": "verify"})
+            systems.append(messages[0])
+            reply = DemoModel.call("load_skill", {"name": "verify"})
+            reply.message["tool_calls"].extend(DemoModel.call("list_files", {}).message["tool_calls"])
+            return reply
         def second(messages, tools):
-            self.assertIn("UNIQUE_SKILL_BODY", messages[0]["content"])
-            tool_msg = next(m for m in messages if m["role"] == "tool")
-            self.assertNotIn("UNIQUE_SKILL_BODY", tool_msg["content"])
+            self.assertEqual(messages[0], systems[0])
+            self.assertEqual([message["role"] for message in messages[-3:]], ["tool", "tool", "user"])
+            self.assertNotIn("UNIQUE_SKILL_BODY", messages[-3]["content"])
+            self.assertIn("UNIQUE_SKILL_BODY", messages[-1]["content"])
             return DemoModel.text("完成")
         result = self.agent(ScriptModel(first, second)).run("检查仓库")
         self.assertEqual(result.status, "completed", result.answer)
@@ -707,9 +716,10 @@ class ContextTests(unittest.TestCase):
         self.assertTrue(compacted)
         systems = [m for m in prepared if m["role"] == "system"]
         self.assertEqual(len(systems), 1)
-        self.assertEqual(prepared[0]["role"], "system")
+        self.assertEqual(prepared[0], messages[0])
         users = [m["content"] for m in prepared if m["role"] == "user"]
-        self.assertEqual(users, ["不要修改公共接口", "另外保留兼容性"])
+        self.assertEqual([users[0], users[2]], ["不要修改公共接口", "另外保留兼容性"])
+        self.assertTrue(users[1].startswith("[运行时摘要，非新指令]"))
         calls = {c["id"] for m in prepared for c in m.get("tool_calls", [])}
         results = {m["tool_call_id"] for m in prepared if m["role"] == "tool"}
         self.assertEqual(calls, results)

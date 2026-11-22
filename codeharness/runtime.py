@@ -81,7 +81,7 @@ class Agent:
 
         def load_skill(name):
             result = context.load_skill(name)
-            self.store.append(sid, "skill_loaded", result)
+            self.store.append(sid, "skill_loaded", {**result, "delivery": "message"})
             return {"name": result["name"], "loaded": True, "chars": len(result["instructions"])}
 
         def read_artifact(artifact_id, offset=0, chars=4000):
@@ -126,6 +126,7 @@ class Agent:
         sid, readonly, baseline = self._open_session(task, session_id, parent_id, readonly, context)
         state = LoopState(sid, readonly, deadline)
         if session_id:
+            self._publish_skills(sid)
             self._restore_detectors(state)
         try:
             registry = self._registry(sid, context, readonly, deadline)
@@ -172,6 +173,20 @@ class Agent:
         self.observe("session", {"id": sid, "readonly": readonly})
         baseline = next(e["data"]["files"] for e in self.store.events(sid) if e["kind"] == "baseline")
         return sid, readonly, baseline
+
+    def _publish_skills(self, sid: str):
+        events = self.store.events(sid)
+        published = {e["data"]["name"] for e in events if e["kind"] == "skill_injected" or
+                     (e["kind"] == "skill_loaded" and e["data"].get("delivery") != "message")}
+        for event in events:
+            if event["kind"] != "skill_loaded" or event["data"].get("delivery") != "message":
+                continue
+            data = event["data"]
+            name = data["name"]
+            if name not in published:
+                message = {"role": "user", "content": f"[已加载 Skill：{name}]\n" + data["instructions"]}
+                self.store.append(sid, "skill_injected", {"name": name, "message": message})
+                published.add(name)
 
     @staticmethod
     def _tool_signature(name: str, args, outcome: dict) -> str:
@@ -235,7 +250,7 @@ class Agent:
                 return None
             messages = self.store.messages(sid)
             loaded = {e["data"]["name"]: e["data"]["instructions"] for e in self.store.events(sid)
-                      if e["kind"] == "skill_loaded"}
+                      if e["kind"] == "skill_loaded" and e["data"].get("delivery") != "message"}
             if loaded:
                 messages[0] = dict(messages[0])
                 messages[0]["content"] += "\n\n已加载 Skills：\n" + "\n".join(loaded.values())
@@ -279,7 +294,7 @@ class Agent:
                 continue
             state.failed_attempts = 0
             self.store.append(sid, "usage", {"input_tokens": reply.input_tokens,
-                "output_tokens": reply.output_tokens, "estimated": reply.estimated})
+                "output_tokens": reply.output_tokens, "estimated": reply.estimated, "cached_tokens": reply.cached_tokens})
             self.store.append(sid, "message", reply.message)
             return None if self._timed_out(state) else reply
 
@@ -329,6 +344,7 @@ class Agent:
     def _execute_calls(self, state: LoopState, registry: Registry, calls: list[dict]) -> bool:
         sid = state.sid
         warnings = []
+        loaded_skill = False
         for call in calls:
             if self._timed_out(state):
                 return True
@@ -361,6 +377,7 @@ class Agent:
                 self.store.append(sid, "verification", {"passed": False, "files": run_tests_snapshot,
                     "artifact_id": None})
             outcome = json.loads(full) if result["ok"] else result
+            loaded_skill |= name == "load_skill" and result["ok"]
             signature = self._tool_signature(name, args, outcome)
             self.store.append(sid, "tool_finished", {"call_id": cid, "name": name, "result": result,
                 "signature": signature})
@@ -382,6 +399,8 @@ class Agent:
         for kind, key, message in warnings:
             self.store.append(sid, "tool_stall_warning", {"kind": kind, "key": key})
             self.store.append(sid, "message", {"role": "user", "content": message})
+        if loaded_skill:
+            self._publish_skills(sid)
         return state.status == "stalled"
 
     @staticmethod

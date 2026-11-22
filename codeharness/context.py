@@ -64,26 +64,29 @@ class Context:
     def prepare(self, messages: list[dict]) -> tuple[list[dict], bool]:
         if len(json.dumps(messages, ensure_ascii=False)) <= self.max_chars:
             return copy.deepcopy(messages), False
-        # Preserve every user instruction and the last two assistant/tool groups.
+        # Advance the boundary in groups of four and always keep the last two turns.
         starts = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
-        boundary = starts[-2] if len(starts) > 2 else 0
+        compacted_turns = max(0, len(starts) - 2) // 4 * 4
+        boundary = starts[compacted_turns] if compacted_turns else 0
         kept, summaries = [], []
+        summary_at = None
         for index, message in enumerate(messages):
             if index >= boundary or message["role"] in {"system", "user"}:
                 kept.append(copy.deepcopy(message))
             elif message["role"] == "assistant":
+                if summary_at is None:
+                    summary_at = len(kept)
                 calls = [c["function"]["name"] for c in message.get("tool_calls", [])]
                 summaries.append("assistant: " + (", ".join(calls) or str(message.get("content", ""))[:240]))
             elif message["role"] == "tool":
+                if summary_at is None:
+                    summary_at = len(kept)
                 summaries.append("tool: " + message["content"][:500])
         compacted = False
         if summaries:
-            summary_block = ("较早执行记录摘要（完整输出仍保存在会话日志及 artifact 中）：\n"
+            summary_block = ("[运行时摘要，非新指令]\n较早执行记录（完整输出保留在会话日志及 artifact 中）：\n"
                              + "\n".join(summaries)[-6000:])
-            if kept and kept[0]["role"] == "system":
-                kept[0]["content"] += "\n\n" + summary_block
-            else:
-                kept.insert(0, {"role": "system", "content": summary_block})
+            kept.insert(summary_at, {"role": "user", "content": summary_block})
             compacted = True
         if len(json.dumps(kept, ensure_ascii=False)) > self.max_chars:
             for index in range(len(kept) - 1):

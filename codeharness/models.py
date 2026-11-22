@@ -65,6 +65,7 @@ class Reply:
     input_tokens: int = 0
     output_tokens: int = 0
     estimated: bool = False
+    cached_tokens: int = 0
 
 
 class Model(Protocol):
@@ -168,6 +169,10 @@ class ChatModel:
             output_tokens = int(usage.get("completion_tokens", len(json.dumps(clean, ensure_ascii=False)) // 3 + 1))
             if min(input_tokens, output_tokens) < 0:
                 raise ValueError("invalid usage")
-            return Reply(clean, input_tokens, output_tokens, estimated)
+            details = usage.get("prompt_tokens_details")
+            cached_tokens = details.get("cached_tokens", 0) if isinstance(details, dict) else 0
+            if type(cached_tokens) is not int or cached_tokens < 0:
+                cached_tokens = 0
+            return Reply(clean, input_tokens, output_tokens, estimated, cached_tokens)
         except (KeyError, IndexError, TypeError, ValueError):
             raise ModelError("模型响应缺少有效的 message、tool_calls 或 usage") from None

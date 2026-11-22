@@ -253,7 +253,7 @@ git worktree remove D:\wt\ch-pre
 | S1 | ☑ | 本地快进合并 `707f8496ee9ccd87b8c05427596e76876981d3a2`。[回归摘要](.codeharness/regress/s1-20261122-234735/summary.json)。`Agent.run` 26 行，最长拆出方法 51 行。83 项中 82 通过、1 跳过，夹具和 demo 结果与 S0 一致。待阶段推送。 |
 | S2 | ☑ | 本地快进合并 `8e51318d8fea9734e1b42615392b57785b8dfb06`。[回归摘要](.codeharness/regress/s2-20261122-235055/summary.json)。86 项中 85 通过、1 跳过，已验证截断恢复、原样记账及旧会话继续执行。待阶段推送。 |
 | S3 | ☑ | 本地快进合并 `6bf420e1107b9eb7bdebd9e13a7cbbfbaf5bb023`。[回归摘要](.codeharness/regress/s3-20261122-235546/summary.json)。90 项中 89 通过、1 跳过，已验证重复提示、恢复后计数和停止状态。待阶段推送。 |
-| S4 | ☐ | |
+| S4 | ☑ | 阶段提交 `02b6f571b4c73844b98f1a0278ddd154670a72eb` 已推送，S1～S4 均已合入远端 `main`。[回归摘要](.codeharness/regress/s4-20261122-235829/summary.json) 93 项中 92 通过、1 项符号链接权限跳过，夹具 12/12 + 3/3，demo 8/5。[CI 6/6](https://github.com/twi66li/CodeHarness/actions/runs/45041275672)。测试工具和独立验收共用环境白名单。 |
 | S5 | ☐ | |
 | S6 | ☐ | |
 | S7 | ☐ | |

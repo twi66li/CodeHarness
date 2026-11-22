@@ -54,7 +54,8 @@ def summarize(cases: list[dict]) -> dict:
     groups = {}
     for row in cases:
         group = groups.setdefault(row["variant"], {"attempted": 0, "passed": 0, "failed": 0, "skipped": 0,
-            "requests": 0, "input_tokens": 0, "output_tokens": 0, "usage_estimated": False, "seconds": 0.0,
+            "requests": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0,
+            "usage_estimated": False, "seconds": 0.0,
             "model_errors": 0, "model_retries": 0, "tool_errors": 0, "failed_verifications": 0,
             "delegate_calls": 0, "compactions": 0, "truncations": 0, "stalled": 0})
         if row.get("skipped"):
@@ -63,7 +64,7 @@ def summarize(cases: list[dict]) -> dict:
             group["attempted"] += 1
             group["passed" if row["success"] else "failed"] += 1
             group["stalled"] += row.get("agent_status") == "stalled"
-        for key in ("requests", "input_tokens", "output_tokens"):
+        for key in ("requests", "input_tokens", "output_tokens", "cached_tokens"):
             group[key] += row.get("usage", {}).get(key, 0)
         group["usage_estimated"] |= row.get("usage", {}).get("estimated", False)
         for key in ("model_errors", "model_retries", "tool_errors", "failed_verifications",
@@ -72,6 +73,7 @@ def summarize(cases: list[dict]) -> dict:
         group["seconds"] += row.get("seconds", 0.0)
     for group in groups.values():
         group["success_rate"] = group["passed"] / group["attempted"] if group["attempted"] else None
+        group["cache_hit_ratio"] = group["cached_tokens"] / group["input_tokens"] if group["input_tokens"] else None
         group["seconds"] = round(group["seconds"], 3)
     return groups
 
@@ -126,6 +128,8 @@ def run_case(task: Task, variant: str, output: Path, directory: Path, model: Mod
                     "agent_verification": result.verification, "changed_files": result.changed_files,
                     "usage": result.usage, "model_access_denied": evidence["model_access_denied"],
                     "diagnostics": evidence})
+        input_tokens = result.usage["input_tokens"]
+        row["cache_hit_ratio"] = result.usage["cached_tokens"] / input_tokens if input_tokens else None
     checked = acceptance(workspace, verifier)
     row.update({"acceptance": checked, "success": checked["passed"], "seconds": time.monotonic() - started})
     return row

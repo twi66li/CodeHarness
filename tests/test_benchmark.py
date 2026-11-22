@@ -38,6 +38,21 @@ class PatchModel:
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_report_counts_cached_input_tokens(self):
+        class CachedModel(TextOnlyModel):
+            def complete(self, *args, **kwargs):
+                reply = super().complete(*args, **kwargs)
+                reply.input_tokens = 20
+                reply.cached_tokens = 8
+                return reply
+
+        with tempfile.TemporaryDirectory() as temp:
+            report = run_suite(TASKS[:1], Path(temp) / "bench", model=CachedModel(),
+                               total_requests=12, total_tokens=24000)
+        self.assertEqual(report["cases"][0]["cache_hit_ratio"], 0.4)
+        self.assertEqual(report["summary"]["delegate"]["cached_tokens"], 8)
+        self.assertEqual(report["summary"]["delegate"]["cache_hit_ratio"], 0.4)
+
     def test_model_cli_reads_dashscope_file_with_multiline_model_list(self):
         with tempfile.TemporaryDirectory() as temp, patch("os.environ", {}), \
                 patch("codeharness.benchmark.ChatModel") as model, \
