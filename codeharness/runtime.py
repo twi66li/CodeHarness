@@ -174,11 +174,17 @@ class Agent:
             sid = self.store.create(self.workspace.root, self.model.name, parent_id)
             self.store.append(sid, "message", {"role": "system", "content": context.system(readonly)})
             self.store.append(sid, "message", {"role": "user", "content": task})
-            self.store.append(sid, "baseline", {"files": snapshot})
+            self._save_snapshot(sid, "baseline", snapshot)
         self.store.status(sid, "running")
         self.observe("session", {"id": sid, "readonly": readonly})
         baseline = next(e["data"]["files"] for e in self.store.events(sid, expand=False) if e["kind"] == "baseline")
         return sid, readonly, baseline
+
+    def _save_snapshot(self, sid: str, kind: str, files: dict):
+        self.store.append(sid, kind, {"files": files})
+        if len(files) > 20000:
+            self.store.append(sid, "workspace_warning", {"files": len(files),
+                "message": "快照超过 20000 个文件。请缩小工作区或用 .gitignore 排除生成物。"})
 
     def _publish_skills(self, sid: str):
         events = self.store.events(sid, expand=False)
@@ -419,7 +425,7 @@ class Agent:
             if tool and tool.effect in {"write", "execute"}:
                 snap = run_tests_snapshot if run_tests_snapshot is not None else self.workspace.snapshot(
                     use_cache=(tool.effect == "write"))
-                self.store.append(sid, "checkpoint", {"files": snap})
+                self._save_snapshot(sid, "checkpoint", snap)
             if self._model_access_error:
                 state.status, state.answer = "error", self._model_access_error
                 return True
@@ -466,7 +472,7 @@ class Agent:
                 verification = "stale"
         if status == "completed" and changes:
             status = "verified" if verification == "passed" else "unverified"
-        self.store.append(sid, "checkpoint", {"files": current})
+        self._save_snapshot(sid, "checkpoint", current)
         self.store.append(sid, "result", {"status": status, "answer": answer, "verification": verification,
             "changed_files": changes})
         self.store.status(sid, status)

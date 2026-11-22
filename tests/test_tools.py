@@ -3,6 +3,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -23,6 +24,37 @@ class RunTestsModel:
 
 
 class ToolTests(unittest.TestCase):
+    def test_git_ignored_files_are_absent_from_list_snapshot_and_search(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
+            (root / ".gitignore").write_text("outputs/\n", encoding="utf-8")
+            (root / "outputs").mkdir()
+            (root / "outputs" / "generated.py").write_text("target = 100", encoding="utf-8")
+            (root / "visible.py").write_text("target = 12", encoding="utf-8")
+            workspace = Workspace(root)
+            registry = Registry(workspace, Policy())
+            register_workspace_tools(registry)
+            self.assertEqual(registry.invoke("list_files", {})["files"], [".gitignore", "visible.py"])
+            self.assertEqual(set(workspace.snapshot()), {".gitignore", "visible.py"})
+            matches = registry.invoke("search", {"query": "target"})["matches"]
+            self.assertEqual([row["path"] for row in matches], ["visible.py"])
+
+    def test_regex_glob_and_limit_are_consistent_without_ripgrep(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "dist").mkdir()
+            (root / "dist" / "out.py").write_text("item_99", encoding="utf-8")
+            (root / "notes.txt").write_text("item_88", encoding="utf-8")
+            (root / "a.py").write_text("item_01\nother\nITEM_02\n", encoding="utf-8")
+            registry = Registry(Workspace(root), Policy())
+            register_workspace_tools(registry)
+            args = {"query": r"item_\d+", "regex": True, "glob": "*.py", "max_results": 1}
+            expected = {"matches": [{"path": "a.py", "line": 1, "text": "item_01"}], "truncated": True}
+            self.assertEqual(registry.invoke("search", args), expected)
+            with patch("codeharness.tools.shutil.which", return_value=None):
+                self.assertEqual(registry.invoke("search", args), expected)
+
     def test_cli_pass_env_changes_only_explicit_test_environment(self):
         for pass_token in (False, True):
             with self.subTest(pass_token=pass_token), tempfile.TemporaryDirectory() as temp:

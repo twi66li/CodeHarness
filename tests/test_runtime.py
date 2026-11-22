@@ -369,6 +369,15 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(sum("base" in e["data"] for e in raw if e["kind"] == "checkpoint"), 21)
         self.assertEqual(self.store.usage(sid)["requests"], 23)
 
+    def test_large_snapshot_writes_a_workspace_warning(self):
+        agent = self.agent(ScriptModel(DemoModel.text("完成")))
+        files = {f"file_{index}.py": "fixture" for index in range(20001)}
+        with patch.object(agent.workspace, "snapshot", return_value=files):
+            result = agent.run("检查仓库")
+        warnings = [event["data"] for event in self.store.events(result.session_id) if event["kind"] == "workspace_warning"]
+        self.assertTrue(warnings)
+        self.assertTrue(all(item["files"] == 20001 and ".gitignore" in item["message"] for item in warnings))
+
     def test_legacy_database_usage_backfills_once_and_stays_shared(self):
         sid = self.store.create(self.root, "fixture")
         child = self.store.create(self.root, "fixture", sid)

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -19,6 +20,7 @@ class ToolError(RuntimeError):
 
 HIDDEN = {".git", ".venv", "venv", ".idea", ".codeharness", ".ssh", ".aws", "node_modules", "__pycache__"}
 PRIVATE_FILENAMES = {".netrc", ".pypirc", ".npmrc", ".git-credentials"}
+WALK_IGNORED = {"dist", "build", "target", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", "htmlcov", ".next"}
 TEST_ENV_NAMES = {
     "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR",
     "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "LANG", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX",
@@ -60,16 +62,44 @@ class Workspace:
 
     def files(self, name: str = "."):
         start = self.path(name)
+        indexed = self._git_files(start)
+        if indexed is not None:
+            yield from indexed
+            return
         if start.is_file():
             yield start
             return
         for current, dirs, names in os.walk(start):
-            dirs[:] = sorted(d for d in dirs if not protected(d)
+            dirs[:] = sorted(d for d in dirs if not protected(d) and d.casefold() not in WALK_IGNORED
                              and not (Path(current) / d).is_symlink())
             for filename in sorted(names):
                 file = Path(current) / filename
                 if not protected(filename) and not file.is_symlink():
                     yield self.path(str(file.relative_to(self.root)))
+
+    def _git_files(self, start: Path):
+        if not (self.root / ".git").exists():
+            return None
+        try:
+            result = subprocess.run(["git", "--no-optional-locks", "--literal-pathspecs", "ls-files", "-z",
+                "--cached", "--others", "--exclude-standard", "--", start.relative_to(self.root).as_posix()],
+                cwd=self.root, capture_output=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode:
+            return None
+        names = {Path(os.fsdecode(item)) for item in result.stdout.split(b"\0") if item}
+        visible = []
+        for relative in sorted(names, key=lambda path: (path.parts[:-1], path.name)):
+            if (self.root / relative).is_symlink():
+                continue
+            try:
+                target = self.path(relative.as_posix())
+            except ToolError:
+                continue
+            if target.is_file():
+                visible.append(target)
+        return visible
 
     def _cache_digest(self, target: Path, raw: bytes | None = None) -> str:
         rel = str(target.relative_to(self.root)).replace("\\", "/")
@@ -291,27 +321,65 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None):
                     return True
         return False
 
-    def search(query, path=".", glob="*"):
+    def search(query, path=".", glob="*", regex=False, max_results=40):
         if not query:
             raise ToolError("搜索内容不能为空")
-        matches = []
-        for file in workspace.files(path):
-            relative = file.relative_to(workspace.root)
-            if not match_glob(relative, glob):
-                continue
-            if file.stat().st_size > 2_000_000:
-                continue
+        if not 1 <= max_results <= 200:
+            raise ToolError("max_results 应在 1 到 200 之间")
+        pattern = None
+        if regex:
+            if len(query) > 200:
+                raise ToolError("正则搜索模式不能超过 200 字符")
             try:
-                text = file.read_text(encoding="utf-8-sig")
-            except UnicodeError:
-                continue
-            for number, line in enumerate(text.splitlines(), 1):
-                if query.casefold() in line.casefold():
-                    matches.append({"path": str(file.relative_to(workspace.root)).replace("\\", "/"),
-                                    "line": number, "text": line[:400]})
-                    if len(matches) >= 40:
-                        return {"matches": matches, "truncated": True}
+                pattern = re.compile(query, re.IGNORECASE)
+            except re.error as exc:
+                raise ToolError(f"无效的正则表达式：{exc}") from None
+        files = [file for file in workspace.files(path)
+                 if match_glob(file.relative_to(workspace.root), glob) and file.stat().st_size <= 2_000_000]
+        rg = shutil.which("rg") if pattern is not None else None
+        folded_query = query.casefold()
+        matches = []
+        for start in range(0, len(files), 16):
+            batch = files[start:start + 16]
+            found = ripgrep_search(rg, query, batch, max_results) if rg else None
+            if found is None:
+                found = python_search(batch, pattern.search if pattern else lambda line: folded_query in line.casefold())
+            for match in found:
+                matches.append(match)
+                if len(matches) >= max_results:
+                    return {"matches": matches, "truncated": True}
         return {"matches": matches, "truncated": False}
+
+    def python_search(files, matches_line):
+        for file in files:
+            try:
+                lines = file.read_text(encoding="utf-8-sig").splitlines()
+            except (OSError, UnicodeError):
+                continue
+            relative = file.relative_to(workspace.root).as_posix()
+            yield from ({"path": relative, "line": number, "text": line[:400]}
+                        for number, line in enumerate(lines, 1) if matches_line(line))
+
+    def ripgrep_search(rg, query, files, limit):
+        paths = [file.relative_to(workspace.root).as_posix() for file in files]
+        try:
+            process = subprocess.run([rg, "--no-config", "--hidden", "--no-ignore", "--json", "--ignore-case",
+                "--max-count", str(limit), "-e", query, "--", *paths], cwd=workspace.root, capture_output=True,
+                encoding="utf-8", timeout=timeout(15))
+        except (OSError, UnicodeError, subprocess.TimeoutExpired):
+            return None
+        if process.returncode not in (0, 1):
+            return None
+        found = {path: [] for path in paths}
+        for line in process.stdout.splitlines():
+            item = json.loads(line)
+            if item["type"] == "match":
+                data = item["data"]
+                relative = data["path"].get("text", "").replace("\\", "/")
+                if relative in found and "text" in data["lines"]:
+                    found[relative].append({"path": relative, "line": data["line_number"],
+                        "text": data["lines"]["text"].rstrip("\r\n")[:400]})
+        return [match for path in paths for match in found[path]]
 
     def syntax_info(path: str, raw: bytes) -> dict:
         if not path.casefold().endswith(".py"):
@@ -406,9 +474,11 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None):
         Tool("read_file", "读取带行号的文本及用于编辑的 sha256。", parameters({
             "path": string("相对文件路径"), "start_line": integer("起始行，默认 1"),
             "lines": integer("行数，默认 160，上限 300")}, ["path"]), read_file),
-        Tool("search", "按字面内容搜索代码，返回路径、行号和匹配片段。", parameters({
+        Tool("search", "搜索代码，返回路径、行号和匹配片段。", parameters({
             "query": string("搜索文本"), "path": string("相对目录或文件"),
-            "glob": string("可选路径匹配规则，例如 *.py 或 app/*.py")}, ["query"]), search),
+            "glob": string("可选路径匹配规则，例如 *.py 或 app/*.py"),
+            "regex": {"type": "boolean", "description": "是否按正则表达式搜索，默认按字面"},
+            "max_results": integer("返回数量上限，默认 40，上限 200")}, ["query"]), search),
         Tool("check_syntax", "检查 Python 文件语法，不执行代码也不阻止编辑。", parameters({"path": string("相对 Python 文件路径")}, ["path"]), check_syntax),
         Tool("edit_file", "精确替换一次文本，sha256 必须来自最新读取。", parameters({
             "path": string("相对文件路径"), "old_text": string("唯一匹配的原文本"),
