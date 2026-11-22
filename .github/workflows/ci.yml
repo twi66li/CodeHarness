@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-regression:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Tests create throwaway Git repositories and worktrees.
+      - name: Configure Git
+        run: |
+          git config --global user.name "codeharness-ci"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+          git config --global core.longpaths true
+
+      # Offline only: unit tests, reference fixtures (full + multi) and the deterministic demo.
+      # No model endpoint or credential is configured in CI.
+      - name: Offline regression
+        run: python -B scripts/regress.py --tag ci
+
+      - name: Upload regression logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regress-${{ matrix.os }}-py${{ matrix.python }}
+          path: |
+            .codeharness/regress/*/*.log
+            .codeharness/regress/*/summary.json
+          include-hidden-files: true
+          retention-days: 14
+          if-no-files-found: ignore

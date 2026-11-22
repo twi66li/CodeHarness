@@ -14,6 +14,259 @@
 
 ## 最新交接单
 
+### 2026-11-22 改进计划启动：执行总清单（Codex 单人串行）
+
+```text
+任务：IMPROVEMENT_PLAN 全部步骤；执行者：Codex（单人串行，不使用多 Agent 并行）；协调：用户
+基线：7263bb2ed9c8469e54fbf6acef812d7cde5d3bff（main，与 origin/main 一致）；工作区：D:\Code\python\CodeHarness；分支：main
+范围：本交接单写入时，只新增或修改了文档、CI 和回归脚本，codeharness/ 与 tests/ 下未改动任何文件
+交付：未提交的工作区差异（见“云端已完成”）；状态：全部步骤待执行
+验证：scripts/regress.py 的结果解析函数已用模拟 unittest 输出验证；其余均未执行（云端不能启动子进程）
+未验证或阻塞：S0 离线回归、ci.yml 首次运行、README 中 Mermaid 图在 GitHub 上的渲染
+下一步：Codex 按下方“Codex 开工任务书”从执行总清单第 1 项开始
+```
+
+#### 执行总清单
+
+由 Codex 一人按顺序执行。⏰ 表示有额度到期时限。每完成一项，就在本节末尾的“执行记录”中填写结果；新会话从第一个未完成的事项继续。
+
+| # | 时限 | 步骤 | 内容 | 详见 |
+| --- | --- | --- | --- | --- |
+| 1 | ⏰ 11/23，可选 | G1 | glm-5.3 到期前补跑改进前重复基线 | 本节“G1” |
+| 2 | 立即 | S0 | 离线回归、提交、推送，确认 CI 通过 | 本节“S0” |
+| 3 | ⏰ 12/12 前，建议紧接 S0 | S0b | 用 deepseek-v4.1-flash 跑改进前基线 | 本节“S0b” |
+| 4 | 尽早 | M0 | 模型池：额度台账，额度用完自动切换 | IMPROVEMENT_PLAN M0 |
+| 5 | ⏰ 11/24 内，可选 | M0 实测 | 用 qwen3.8-flash 做一次真实切换 | 本节“M0 实测” |
+| 6～15 | — | S1 → S2 → S3 → S4 → S5 → S6 → S7 → S8 → S9 → S10 | 运行时、工具、上下文、存储 | IMPROVEMENT_PLAN 对应各节 |
+| 16～17 | — | S11 → S12 | 多次运行统计、大仓库评测套件 | IMPROVEMENT_PLAN 对应各节 |
+| 18 | ⏰ E1、E4 须在 12/12 前完成 | S13 | 真实模型实验 | IMPROVEMENT_PLAN S13 |
+| 19 | — | S14 | 实测表、时间线示例、简历口径 | IMPROVEMENT_PLAN S14 |
+
+**日期检查点**：每次开工先看当前日期（UTC+8）。
+
+- 已过 11/23：跳过 G1。
+- 已过 11/24：跳过 M0 实测。
+- 已到 12/08 而 S13 还没开始：暂停当前步骤，按 IMPROVEMENT_PLAN S13 的“延期预案”，先用已完成的版本跑 E0、E1、E4，再回来继续剩余步骤。
+
+S13 必须在 M0、S11 完成之后才能开始，所以无论如何，M0 和 S11 要在 12/08 前完成。如果进度紧张，可以把 S11、S12 提前到 S1 之前做。S12 依赖 S8，所以提前时要连 S8 一起提前。调整顺序要写入执行记录。
+
+#### 授权与运行环境
+
+- **用户授权**（用户可在此修改）：
+  - 可以在本仓库创建分支、提交、合并到本地 `main`，并推送 `origin main`。
+  - 禁止强制推送，禁止改写已推送的历史。
+  - 可以按“模型额度与使用规则”调用真实模型。
+  - 可以在本机执行测试与评测代码。
+- **网络与沙箱**：
+  - 运行 Codex 时，需要允许写入 `.git`、访问网络（推送和模型调用都需要），并允许本地回环连接（5 项 HTTP 测试需要）。
+  - 历史上曾出现 `.git` 只读和回环受限（`WinError 10013`）。
+  - `.git` 不可写或无法联网时：停止需要它的操作，写入执行记录的“待用户决定”，继续其他不受影响的工作。
+  - 回环受限时：用 `--skip-loopback` 运行回归，并在记录中注明。
+- **凭据**：只放在本地 `.env`，不要写入提交、报告摘要或交接正文。
+
+#### 分支与合并（单人串行）
+
+- 每一步都从最新的本地 `main` 新建分支 `codex/<步骤小写>-<slug>`（例如 `codex/m0-model-pool`、`codex/s1-split-run`），直接在主仓库工作，不需要额外的 worktree。唯一的例外是 S0b，见下文。
+- 一步完成并验收后：
+  1. `git diff --check`；
+  2. 一步一个提交；
+  3. 运行 `python -B scripts/regress.py --tag <步骤> --compare <S0 summary>`，结果与 S0 一致（或者差异符合该步的预期）；
+  4. `git switch main && git merge --ff-only <分支>`；
+  5. 在执行记录填写提交号与 summary 路径，在 IMPROVEMENT_PLAN.md 进度表中把该步标记为完成。
+- 每个阶段结束时推送一次 `origin main`，确认 CI 通过，并按 AGENTS.md 的格式在本节下方追加一条阶段交接单。阶段边界为：S0b/M0、S1～S4、S5～S6、S7～S8、S9～S10、S11～S13、S14。
+- 涉及 `ModelError` 的顺序：M0 先新增 `status`、`code`、`quota_exhausted` 字段，S2 再在此基础上新增 `truncated` 和 `usage`。
+- 新测试文件：M0 → `tests/test_model_pool.py`，S4/S8/S9 → `tests/test_tools.py`，S7 → `tests/test_scale.py`。其余步骤沿用现有测试文件。
+- 保持文件原有的换行风格：`codeharness/` 下的 Python 源码是 CRLF，Markdown 是 LF。
+
+#### 模型额度与使用规则
+
+截至 2026-11-22 23:00（UTC+8），来自用户的百炼控制台截图。执行前以控制台为准。
+
+| 模型 | 剩余 / 总额 | 到期 | 用途 | 计划用量 |
+| --- | --- | --- | --- | --- |
+| glm-5.3 | 294.94K / 1M | 2026-11-23 | G1 改进前重复基线（可选） | ≤ 250K |
+| qwen3.8-flash | 41.78K / 1M | 2026-11-25 | M0 真实切换验证（可选） | ≤ 30K |
+| qwen3.8-max-0902 | 145.94K / 1M | 2026-12-01 | 切换链末位备用；预计 S13 前到期 | 0 |
+| deepseek-v4.1-flash | 918.74K / 1M | 2026-12-13 | S0b，以及 S13 的 E0、E1、E4 | 约 675K |
+| deepseek-v4.1-flash-1017 | 996.95K / 1M | 2027-01-17 | M0 切换目标，以及 S13 的 E0、E2、E3 | 约 750K |
+
+1. **额度耗尽的表现。** 截图中每个模型最后一列的开关都是开启的（看起来是“用完即停”）。公开反馈显示，百炼开启“用完即停”后，免费额度耗尽会返回 HTTP 403。当前 `models.py` 把所有 401/403 都当作“访问被拒绝”，评测会停止全部后续任务，不会换模型。M0 负责修复。
+2. **M0 合入前的真实调用（G1、S0b）只用单一模型**，并用 `--total-tokens` 把上限封在剩余额度以内。
+3. **额度只用于 CodeHarness 评测调用。** Codex 自身使用的模型不占用这些额度。不要把 Codex 本身配置成使用百炼的这几个模型，尤其是两个 deepseek 模型，它们要留给评测。
+4. **每次真实调用前在控制台核对剩余额度。** M0 合入后，同步更新 `.codeharness/models.json` 中的 `quota_tokens` 和 `quota_as_of`。
+5. **对比只在同一模型内进行。** 自动切换只发生在“对比单元”的边界，即一个任务的委派开、关一组。报告按模型分组。切换后缺少同模型对照时，余量允许时补跑同模型对照，否则在结论中如实标注。
+6. **到期日当天视为不可用。** 模型池自动选择时按 UTC+8 保守处理。手动执行的 G1 例外，以控制台实际能否调用为准。
+7. **推理强度。** G1 与历史 glm 报告保持一致，使用 `--reasoning-effort low`。deepseek 在 S0b 冒烟中先不传该参数；如果百炼文档确认该模型支持，再让 S0b 与 S13 统一使用同一设置。选择结果写入执行记录。
+8. 截图显示这些都是免费额度，且已开启用完即停，所以真实调用不需要另行确认费用，但必须遵守上述规则和各步的停止条件。
+
+#### 云端已完成
+
+- `IMPROVEMENT_PLAN.md`：S0～S14 以及 S0b、M0 的有序计划，每一步都写明改动、测试和验收。
+- `scripts/regress.py`：一条命令运行单元测试、`full` 和 `multi` 参考夹具、委派开/关 demo。结果输出到 `.codeharness/regress/<tag>-<时间>/summary.json`，支持 `--compare`、`--skip-loopback`。
+- `.github/workflows/ci.yml`：在 Ubuntu 和 Windows、Python 3.11/3.12/3.13 上运行 `scripts/regress.py` 并上传日志，不配置任何模型凭据。
+- `README.md`：新增 CI 徽章、Mermaid 架构图、模块职责表和回归脚本说明。`README.en.md` 是对应的英文版，内容以中文版为准。
+- 本交接单。
+
+**已确认的事实**
+- 下方历史条目里的基线 `47c5c8da…` 是 4 个模块提交之前的旧基线，本轮以 `7263bb2` 为准。
+- 已有的真实模型报告都是 glm-5.3、每题只跑 1 次。所有报告中 `delegate_calls = 0`、`compactions = 0`，也就是说委派和压缩还没有任何真实模型证据。
+- S13 将改用 deepseek 模型，所以历史 glm 结果不能直接当作 S13 的改进前对照，需要 S0b。
+
+**未提交的新增或修改文件**：`IMPROVEMENT_PLAN.md`、`scripts/regress.py`、`.github/workflows/ci.yml`、`README.md`、`README.en.md`、`HANDOFF.md`。
+
+#### G1（可选，11/23）：glm-5.3 改进前重复基线
+
+到期时间以控制台为准：11/23 当天还能调用就执行；一旦报 403 或 `model_access_denied: true`，立即放弃。这一步只改了文档和脚本，运行时代码与 S0 基线一致，所以可以直接在主仓库执行，排在 S0 之前也没问题：
+
+```powershell
+cd D:\Code\python\CodeHarness
+python -B -m codeharness.benchmark --mode model --suite core --model glm-5.3 --env-file .env --allow-exec --reasoning-effort low --output-tokens 4096 --total-requests 60 --total-tokens 120000 --output .codeharness/benchmarks/pre-glm-core-r2
+python -B -m codeharness.benchmark --mode model --suite multi --model glm-5.3 --env-file .env --allow-exec --reasoning-effort low --output-tokens 4096 --max-requests 18 --max-tokens 40000 --total-requests 54 --total-tokens 120000 --output .codeharness/benchmarks/pre-glm-multi-r2
+```
+
+- 预计用量约 130K。跑完后看控制台：glm-5.3 剩余 ≥ 150K 时，用输出目录后缀 `-r3` 再跑一轮，否则停止。
+- 这批数据与 11/21 的 `glm53-core-low-20261121`、`glm53-multi-low-20261121` 合在一起，得到 n=2～3 的改进前 glm 数据，只用来估计同一模型重复运行的波动。
+
+#### S0：离线基线
+
+```powershell
+cd D:\Code\python\CodeHarness
+git status --short --branch
+python -B scripts/regress.py --tag s0
+```
+
+预期：单元测试 78 项 OK（skipped=1，符号链接）；夹具 `full` 12/12、`multi` 3/3；demo 委派开 8 次请求、关 5 次，均为 `verified`。
+
+- 不符合预期：先排查原因，把结论写入执行记录，不要继续后面的步骤。
+- 符合预期：提交并推送：
+
+```powershell
+git add IMPROVEMENT_PLAN.md scripts/regress.py .github/workflows/ci.yml README.md README.en.md HANDOFF.md
+git commit -m "docs: 新增改进计划、离线回归脚本、CI 与英文 README"
+git push origin main
+```
+
+推送后：
+1. 新提交号记为 **S0 提交**。
+2. `.codeharness/regress/s0-<时间>/summary.json` 的绝对路径记为 **S0 summary**。
+3. 在 GitHub Actions 确认 CI 全部通过。失败时记录失败的矩阵项和日志摘要；属于环境差异的，修复 `ci.yml` 后重新推送。
+4. 在 IMPROVEMENT_PLAN.md 进度表中把 S0 标记为完成。
+
+#### S0b：deepseek-v4.1-flash 改进前基线（12/12 前）
+
+S13 的改进前后对比必须用同一个模型，所以要在 S0 提交上用 deepseek-v4.1-flash 先跑一遍。这里用临时 worktree，好让 `main` 可以照常往前推进。
+
+```powershell
+git -C D:\Code\python\CodeHarness worktree add --detach D:\wt\ch-pre <S0 提交>
+cd D:\wt\ch-pre
+$envf = "D:\Code\python\CodeHarness\.env"
+$out = "D:\Code\python\CodeHarness\.codeharness\benchmarks"
+# 1) 冒烟：确认工具调用、usage 和独立验收都正常
+python -B -m codeharness.benchmark --mode model --task discount --model deepseek-v4.1-flash --env-file $envf --allow-exec --output-tokens 4096 --total-requests 12 --total-tokens 24000 --output "$out\pre-ds-smoke"
+# 2) 冒烟通过后，跑两轮 core + multi
+foreach ($r in 1, 2) {
+  python -B -m codeharness.benchmark --mode model --suite core --model deepseek-v4.1-flash --env-file $envf --allow-exec --output-tokens 4096 --total-requests 60 --total-tokens 120000 --output "$out\pre-ds-core-r$r"
+  python -B -m codeharness.benchmark --mode model --suite multi --model deepseek-v4.1-flash --env-file $envf --allow-exec --output-tokens 4096 --max-requests 18 --max-tokens 40000 --total-requests 54 --total-tokens 120000 --output "$out\pre-ds-multi-r$r"
+}
+cd D:\Code\python\CodeHarness
+git worktree remove D:\wt\ch-pre
+```
+
+预计用量约 270K（按 glm 实测每题 13K～21K 估算，以冒烟的实测结果校正）。
+
+**停止条件**
+- **冒烟未通过**（工具调用格式不兼容、模型名错误、usage 缺失等）：停止 S0b，记录错误，先做 M0；需要改运行时才能兼容的，放到对应步骤里处理。处理完之后，仍然要在 S0 提交上重跑 S0b。如果做不到，就在记录中说明。
+- **任一报告出现 `model_access_denied: true`**：立即停止。用 `python -m codeharness trace <session_id> --workspace <该用例的 repo 目录> --store <该用例的 state.sqlite3> --json` 找到 `model_error` 事件，把 HTTP 状态码和括号里的错误码写入执行记录，M0 用它识别额度耗尽。
+- **用量**：每轮结束后看控制台余额，累计超过 320K 就不再跑剩下的部分。
+
+推理强度的选择按“模型额度与使用规则”第 7 条处理，并写入执行记录。
+
+#### M0 实测（可选，11/24 内，M0 合入本地 `main` 后）
+
+在主仓库执行：
+
+1. 复制 `models.example.json` 为 `.codeharness/models.json`。用控制台数字更新所有 `quota_tokens`，把 `quota_as_of` 设为当前时间（UTC+8）。
+2. 临时给 qwen3.8-flash 加上 `"cap_tokens": 30000`。
+3. 执行：
+   ```powershell
+   python -m codeharness.model_pool status --config .codeharness/models.json
+   python -B -m codeharness.benchmark --mode model --task discount --model-pool .codeharness/models.json --models qwen3.8-flash,deepseek-v4.1-flash-1017 --env-file .env --allow-exec --output-tokens 4096 --total-requests 12 --total-tokens 24000 --output .codeharness/benchmarks/m0-switch-1
+   python -B -m codeharness.benchmark --mode model --task discount --model-pool .codeharness/models.json --models qwen3.8-flash,deepseek-v4.1-flash-1017 --env-file .env --allow-exec --output-tokens 4096 --total-requests 12 --total-tokens 24000 --output .codeharness/benchmarks/m0-switch-2
+   python -m codeharness.model_pool status --config .codeharness/models.json
+   ```
+4. 预期：第 1 次在 qwen3.8-flash 上运行；第 2 次开始前，因为 qwen3.8-flash 的剩余额度不足一个用例的预算，自动切到 deepseek-v4.1-flash-1017。报告中的 `model` 字段与 `status` 输出一致。
+5. 结束后删除 `cap_tokens`。
+6. 真实的“403 耗尽后切换”不做实测，只靠离线测试覆盖；S0b 如果碰到真实的耗尽错误码，补进 `quota_error_codes`。
+
+#### Codex 开工任务书（首次发送）
+
+```text
+你是 CodeHarness 仓库的唯一执行者，按顺序完成本轮改进计划的全部步骤，包括开发、测试、真实模型评测和文档收尾。
+仓库：D:\Code\python\CodeHarness（GitHub：twi66li/CodeHarness），Python 3.11+，运行时只用标准库。
+
+开工：
+1. 依次阅读 AGENTS.md、HANDOFF.md 中“2026-11-22 改进计划启动”一节的全部内容、IMPROVEMENT_PLAN.md。以当前源码、Git 状态和 HANDOFF“执行记录”为准。
+2. 检查当前日期（UTC+8），按“日期检查点”决定是否跳过 G1、M0 实测，或者改为先做 S13 的延期预案。
+3. 从执行总清单中第一个未完成的事项开始，逐项执行。
+
+每一步的做法：
+- 按 IMPROVEMENT_PLAN.md 对应一节的“改动”“测试”“验收”执行：先写失败的测试，再实现。只改该步需要的文件，不顺手重构。
+- 按 HANDOFF“分支与合并”建分支、提交、运行 scripts/regress.py --compare，快进合入本地 main。
+- 涉及事件格式的步骤（S2、S5、S6、S7、S10），必须附“旧格式会话仍可 sessions/trace/resume”的测试。
+- S1 是纯重构：回归结果必须与 S0 完全一致，demo 请求次数仍为 8 / 5。
+- M0 的 ModelPool 必须实现现有的 Model 协议，runtime 不做改动；后续步骤不能破坏这一点。
+- 每完成一步，立即更新 HANDOFF“执行记录”和 IMPROVEMENT_PLAN 进度表，然后继续下一步，不需要等待确认。
+- 阶段结束时推送 origin main，确认 CI 通过，并按 AGENTS.md 的格式追加阶段交接单。
+
+真实模型调用（只在 G1、S0b、M0 实测、S13 中进行）：
+- 严格遵守 HANDOFF“模型额度与使用规则”和各步的停止条件。每次调用前在百炼控制台或 model_pool status 中核对剩余额度。
+- 开发和测试过程中一律使用假模型，不使用 .env。
+- 凭据不要写入任何提交、报告摘要或交接正文。
+
+遇到以下情况，写入执行记录的“待用户决定”，然后继续其他不受影响的事项：
+- 额度不足以完成必需的实验；
+- .git 不可写或无法联网；
+- 某一步的验收标准无法满足，且原因不在本步范围内；
+- 需要偏离 IMPROVEMENT_PLAN 的设计。
+
+不要做：强制推送、改写已推送历史、修改 benchmark_tasks.py 中已有任务的题面与验收、把 .env 或会话库加入 Git。
+```
+
+#### Codex 续作提示词（新会话或中断后发送）
+
+```text
+继续 CodeHarness 改进计划。先读 AGENTS.md、HANDOFF.md 中“2026-11-22 改进计划启动”一节（重点看执行记录和日期检查点）、IMPROVEMENT_PLAN.md，然后运行 git status --short --branch 和 git log --oneline -5，核对执行记录与实际 Git 状态是否一致：
+- 有未完成的分支或未提交改动：先确认它属于哪一步，再继续该步；
+- 状态一致：从执行总清单中第一个未完成的事项继续。
+规则与首次任务书相同，以 HANDOFF 中的“Codex 开工任务书”为准。
+```
+
+#### 执行记录
+
+| 事项 | 状态 | 结果与证据 |
+| --- | --- | --- |
+| G1 glm-5.3 重复基线 | ☑ | `low`、输出上限 4096。[core r2](.codeharness/benchmarks/pre-glm-core-r2/report.json) 5/5，32 次，60,556 Token。[multi r2](.codeharness/benchmarks/pre-glm-multi-r2/report.json) 2/3，25 次，75,467 Token，`ledger-reconcile` 耗尽单题预算。合计 136,023 Token，按本轮用量再跑完整一轮会超过 G1 的 250K 总上限。两套件均未触发委派或压缩。 |
+| S0 | ◐ | [S0 summary](.codeharness/regress/s0-20261122-232004/summary.json)。Windows / Python 3.13.12，78 项中 77 通过、1 项符号链接因权限跳过，12/12 + 3/3 夹具通过，离线 demo 为 8/5 次请求且均 verified。CI 待验收。 |
+| S0b | ☐ | 冒烟结果；各轮报告目录、成功数、用量；推理强度设置；遇到的错误码 |
+| M0 | ☐ | 提交号；regress summary |
+| M0 实测 | ☐ | 两次运行使用的模型；status 输出 |
+| S1 | ☐ | |
+| S2 | ☐ | |
+| S3 | ☐ | |
+| S4 | ☐ | |
+| S5 | ☐ | |
+| S6 | ☐ | |
+| S7 | ☐ | |
+| S8 | ☐ | |
+| S9 | ☐ | |
+| S10 | ☐ | |
+| S11 | ☐ | |
+| S12 | ☐ | |
+| S13 | ☐ | 各实验的报告目录、模型、n、主要结论 |
+| S14 | ☐ | |
+| 顺序调整 | — | 偏离执行总清单顺序时，记录原因 |
+| 待用户决定 | — | |
+
 ### 2026-11-21 晚间评审修复与 `multi` 多模块真实评测收口
 
 基线：`47c5c8da9e68227ed63e22cd098746fcb4d83096`（分支 `main`）；工作区：`D:/Code/python/CodeHarness`；状态：全部开发与实测验证完成，按模块拆分 4 个提交发布到 `origin/main`。

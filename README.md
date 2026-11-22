@@ -1,6 +1,45 @@
 # CodeHarness
 
+[![CI](https://github.com/twi66li/CodeHarness/actions/workflows/ci.yml/badge.svg)](https://github.com/twi66li/CodeHarness/actions/workflows/ci.yml)
+
 使用 Python 实现的可扩展编码 Agent 运行时。Python 3.11+，运行时仅使用标准库。
+
+[English](README.en.md)
+
+## 架构
+
+```mermaid
+flowchart LR
+    CLI["cli.py<br/>run / resume / demo / sessions / trace"] --> Agent
+    Bench["benchmark.py<br/>fixtures / model 评测"] --> Agent
+    Bench --> Accept["独立验收脚本<br/>位于 Agent 工作区之外"]
+
+    subgraph Agent["runtime.Agent 统一执行循环"]
+        direction TB
+        Budget["请求 / Token / 时间预算检查"] --> Prepare["Context.prepare<br/>保留用户消息与最近回合"]
+        Prepare --> Call["Model.complete<br/>有限重试与退避"]
+        Call --> Batch["执行 tool_calls 批次"]
+        Batch --> Check["checkpoint / verification"]
+        Check --> Budget
+    end
+
+    Call --> Model["models.ChatModel<br/>Chat Completions 兼容"]
+    Prepare --> Ctx["context.Context<br/>AGENTS.md · Skills · 压缩"]
+    Batch --> Reg["tools.Registry<br/>schema 校验 → before 钩子 → Policy → 执行 → after 钩子"]
+    Reg --> WS["tools.Workspace<br/>路径边界 · 受保护文件 · sha256 快照"]
+    Batch -- delegate --> Child["只读子任务<br/>同一循环 · 独立上下文 · 共享 root 预算 · ≤6 次请求"]
+    Agent --> Store[("store.Store · SQLite<br/>sessions · 追加事件 · artifacts")]
+    Store -. resume / repair_pending .-> Agent
+```
+
+| 模块 | 职责 |
+| --- | --- |
+| `runtime.py` | 执行循环、预算与超时、重试、工具批次、只读委派、最终状态与验证判定 |
+| `models.py` | 模型接口协议与 Chat Completions 适配，错误分类、`Retry-After`、响应清洗 |
+| `tools.py` | 工作区路径边界、权限策略、工具注册与参数校验、内置文件/搜索/测试/Git 工具 |
+| `context.py` | 系统提示、`AGENTS.md` 与 Skills 加载、超阈值时的历史回合压缩 |
+| `store.py` | SQLite 追加事件、产物分页、用量汇总、中断工具调用的补全 |
+| `benchmark.py` / `benchmark_tasks.py` | 独立验收评测、委派消融、业务夹具 |
 
 ## 运行
 
@@ -104,6 +143,8 @@ python -m codeharness.benchmark --mode model --suite core --variants both --env-
 确定性 demo（启用委派 8 次调用、禁用 5 次调用）均修复折扣并通过测试，仅用于验证执行链路而非模型能力。完整分段记录与复现命令见 [交接记录](HANDOFF.md#最新交接单)。
 
 正常环境使用 `python -m unittest discover -s tests -v` 完整回归。如果明确禁止本地回环连接，可以在 PowerShell 设置 `$env:CODEHARNESS_SKIP_LOOPBACK='1'`，显式跳过 5 项真实本地 HTTP 集成测试；模拟传输与 CLI 工具链测试仍然运行。该模式不等同于完整网络回归。
+
+`python -B scripts/regress.py --tag <标签>` 一次运行单元测试、`full` 与 `multi` 参考夹具及启用、禁用委派的离线 demo，结果与日志写入 `.codeharness/regress/`；`--compare <summary.json>` 与之前的结果对比，`--skip-loopback` 等同于上面的环境变量。CI 在 Ubuntu 与 Windows、Python 3.11～3.13 上运行同一脚本，不调用真实模型。
 
 ## 设计取舍
 
