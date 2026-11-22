@@ -12,6 +12,7 @@ import uuid
 
 from .benchmark_tasks import ALL_TASKS, MULTI_TASKS, TASKS, Task
 from .cli import load_env, model_connection
+from .model_pool import ModelPool
 from .models import ChatModel, Model
 from .runtime import Agent, Limits
 from .store import Store
@@ -58,9 +59,9 @@ def summarize(cases: list[dict]) -> dict:
             "delegate_calls": 0, "compactions": 0})
         if row.get("skipped"):
             group["skipped"] += 1
-            continue
-        group["attempted"] += 1
-        group["passed" if row["success"] else "failed"] += 1
+        else:
+            group["attempted"] += 1
+            group["passed" if row["success"] else "failed"] += 1
         for key in ("requests", "input_tokens", "output_tokens"):
             group[key] += row.get("usage", {}).get(key, 0)
         group["usage_estimated"] |= row.get("usage", {}).get("estimated", False)
@@ -99,6 +100,33 @@ def diagnostics(store: Store) -> dict:
     return result
 
 
+def run_case(task: Task, variant: str, output: Path, directory: Path, model: Model | None, limits: Limits) -> dict:
+    started = time.monotonic()
+    workspace, verifier, baseline = prepare_case(task, directory)
+    row = {"task": task.id, "variant": variant, "workspace": str(workspace.relative_to(output)), "baseline": baseline}
+    # The initial fixture must fail a requirement assertion, not fail to import or run.
+    if baseline["passed"] or "AssertionError" not in baseline["output"]:
+        row.update({"success": False, "invalid_fixture": True, "seconds": time.monotonic() - started})
+        return row
+    if model is None:
+        materialize(workspace, task.reference)
+    else:
+        store = Store(directory / "state.sqlite3")
+        try:
+            result = Agent(model, workspace, store, Policy(allow_write=True, allow_exec=True), limits,
+                           enable_delegate=variant == "delegate").run(task.prompt)
+            evidence = diagnostics(store)
+        finally:
+            store.close()
+        row.update({"session_id": result.session_id, "agent_status": result.status,
+                    "agent_verification": result.verification, "changed_files": result.changed_files,
+                    "usage": result.usage, "model_access_denied": evidence["model_access_denied"],
+                    "diagnostics": evidence})
+    checked = acceptance(workspace, verifier)
+    row.update({"acceptance": checked, "success": checked["passed"], "seconds": time.monotonic() - started})
+    return row
+
+
 def run_suite(tasks: tuple[Task, ...], output: Path, *, model: Model | None = None,
               limits: Limits | None = None, variants: tuple[str, ...] = ("delegate",),
               total_requests: int | None = None, total_tokens: int | None = None) -> dict:
@@ -122,61 +150,72 @@ def run_suite(tasks: tuple[Task, ...], output: Path, *, model: Model | None = No
     if isinstance(model, ChatModel) and model.reasoning_effort is not None:
         report["reasoning_effort"] = model.reasoning_effort
 
-    def save(row):
-        report["cases"].append(row)
+    pool = model if isinstance(model, ModelPool) else None
+    variants = variants if model is not None else ("reference",)
+
+    def save(rows):
+        report["cases"].extend(rows)
         report["summary"] = summarize(report["cases"])
+        if pool is not None:
+            by_model = {}
+            for row in report["cases"]:
+                if row["model"] is not None:
+                    by_model.setdefault(row["model"], []).append(row)
+            report["summary_by_model"] = {name: summarize(entries) for name, entries in by_model.items()}
+            report["model"] = next(iter(by_model)) if len(by_model) == 1 else None
         (output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     used_requests = used_tokens = 0
     access_denied = False
-    for task in tasks:
+
+    def blocked(slots):
         if access_denied:
+            return "model_access_denied"
+        if model is not None and (total_requests - used_requests < limits.max_requests * slots
+                                  or total_tokens - used_tokens < limits.max_tokens * slots):
+            return "total_budget"
+        return None
+
+    for task in tasks:
+        tried = set()
+        while True:
+            reason = blocked(len(variants))
+            chosen = None
+            if pool is not None and reason is None:
+                chosen = pool.choose(limits.max_tokens * len(variants), excluded=tried)
+                if chosen is None:
+                    reason = "quota_exhausted"
+                else:
+                    pool.pin(chosen)
+
+            rows = []
             for variant in variants:
-                save({"task": task.id, "variant": variant, "skipped": "model_access_denied"})
-            continue
-        if model is not None and (total_requests - used_requests < limits.max_requests * len(variants)
-                                  or total_tokens - used_tokens < limits.max_tokens * len(variants)):
-            for variant in variants:
-                save({"task": task.id, "variant": variant, "skipped": "total_budget"})
-            continue
-        for variant in (variants if model is not None else ("reference",)):
-            if access_denied:
-                save({"task": task.id, "variant": variant, "skipped": "model_access_denied"})
-                continue
-            # A provider can report more tokens than the pre-request estimate.
-            if model is not None and (total_requests - used_requests < limits.max_requests
-                                      or total_tokens - used_tokens < limits.max_tokens):
-                save({"task": task.id, "variant": variant, "skipped": "total_budget"})
-                continue
-            started = time.monotonic()
-            directory = output / task.id / variant
-            workspace, verifier, baseline = prepare_case(task, directory)
-            row = {"task": task.id, "variant": variant, "workspace": str(workspace.relative_to(output)),
-                   "baseline": baseline}
-            # The initial fixture must fail a requirement assertion, not fail to import or run.
-            if baseline["passed"] or "AssertionError" not in baseline["output"]:
-                row.update({"success": False, "invalid_fixture": True, "seconds": time.monotonic() - started})
-                save(row)
-                continue
-            if model is None:
-                materialize(workspace, task.reference)
-            else:
-                store = Store(directory / "state.sqlite3")
-                try:
-                    result = Agent(model, workspace, store, Policy(allow_write=True, allow_exec=True), limits,
-                                   enable_delegate=variant == "delegate").run(task.prompt)
-                    evidence = diagnostics(store)
-                    access_denied = evidence["model_access_denied"]
-                finally:
-                    store.close()
-                row.update({"session_id": result.session_id, "agent_status": result.status,
-                            "agent_verification": result.verification, "changed_files": result.changed_files,
-                            "usage": result.usage, "model_access_denied": access_denied, "diagnostics": evidence})
-                used_requests += result.usage["requests"]
-                used_tokens += result.usage["input_tokens"] + result.usage["output_tokens"]
-            checked = acceptance(workspace, verifier)
-            row.update({"acceptance": checked, "success": checked["passed"], "seconds": time.monotonic() - started})
-            save(row)
+                skipped = reason or ("model_quota_exhausted" if pool and pool.quota_exhausted else blocked(1))
+                if skipped:
+                    row = {"task": task.id, "variant": variant, "skipped": skipped}
+                else:
+                    directory = output / task.id / variant
+                    row = run_case(task, variant, output, directory / chosen if chosen else directory, model, limits)
+                    access_denied = row.get("model_access_denied", False)
+                    usage = row.get("usage", {})
+                    used_requests += usage.get("requests", 0)
+                    used_tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+                    if pool and pool.quota_exhausted:
+                        row["skipped"] = "model_quota_exhausted"
+                if pool is not None:
+                    row["model"] = chosen
+                    if chosen is not None and pool.adapters[chosen].reasoning_effort is not None:
+                        row["reasoning_effort"] = pool.adapters[chosen].reasoning_effort
+                rows.append(row)
+
+            retry_pair = chosen is not None and pool.quota_exhausted
+            if retry_pair:
+                for row in rows:
+                    row.setdefault("skipped", "incomplete_model_pair")
+                tried.add(chosen)
+            save(rows)
+            if not retry_pair:
+                break
     return report
 
 
@@ -191,6 +230,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, help="新建报告目录；默认 .codeharness/benchmarks/<id>")
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--model")
+    parser.add_argument("--model-pool", type=Path)
+    parser.add_argument("--models", help="覆盖模型池顺序，使用逗号分隔")
     parser.add_argument("--reasoning-effort", help="模型支持时设置推理强度，例如 low")
     parser.add_argument("--base-url")
     parser.add_argument("--allow-exec", action="store_true", help="同意真实模型修改并在本机执行评测代码")
@@ -203,15 +244,24 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         model = None
+        if args.models and not args.model_pool:
+            raise ValueError("--models 需要配合 --model-pool")
         if args.mode == "model":
             if not args.allow_exec:
                 raise ValueError("真实模型评测需要 --allow-exec；测试会在本机执行项目代码")
             env = {**load_env(args.env_file), **os.environ}
-            name = args.model or env.get("CODEHARNESS_MODEL") or env.get("OPENAI_MODEL")
-            url, key = model_connection(env, args.base_url)
-            if not name or not url or name == "offline-demo":
-                raise ValueError("请配置实际模型名与接口地址；离线演示不能作为真实模型评测")
-            model = ChatModel(name, url, key, reasoning_effort=args.reasoning_effort)
+            if args.model_pool:
+                if args.model or args.base_url:
+                    raise ValueError("--model-pool 使用池配置中的模型和接口地址")
+                model = ModelPool(args.model_pool, env=env, order=args.models, reasoning_effort=args.reasoning_effort)
+            else:
+                name = args.model or env.get("CODEHARNESS_MODEL") or env.get("OPENAI_MODEL")
+                url, key = model_connection(env, args.base_url)
+                if not name or not url or name == "offline-demo":
+                    raise ValueError("请配置实际模型名与接口地址；离线演示不能作为真实模型评测")
+                model = ChatModel(name, url, key, reasoning_effort=args.reasoning_effort)
+        elif args.model_pool:
+            raise ValueError("模型池只用于真实模型评测")
         output = args.output or Path(".codeharness/benchmarks") / uuid.uuid4().hex[:10]
         variants = ("delegate", "no-delegate") if args.variants == "both" else (args.variants,)
         suite_map = {"core": TASKS[:5], "full": TASKS, "multi": MULTI_TASKS}
@@ -222,7 +272,10 @@ def main(argv: list[str] | None = None) -> int:
             variants=variants, total_requests=args.total_requests, total_tokens=args.total_tokens)
         print(json.dumps({"mode": report["mode"], "report": str(output.resolve() / "report.json"),
                           "summary": report["summary"]}, ensure_ascii=False, indent=2))
-        return 0 if all(row.get("success", False) for row in report["cases"]) else 2
+        rows = report["cases"]
+        if args.model_pool:
+            rows = {(row["task"], row["variant"]): row for row in rows}.values()
+        return 0 if all(row.get("success", False) and not row.get("skipped") for row in rows) else 2
     except (ValueError, OSError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2

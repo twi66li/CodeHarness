@@ -162,6 +162,12 @@ class Agent:
                 if compacted:
                     self.store.append(sid, "context_compacted", {"original_messages": len(messages),
                         "sent_messages": len(prepared), "strategy": "keep_user_constraints_and_recent_turns"})
+                prepare_attempt = getattr(self.model, "prepare_attempt", None)
+                if prepare_attempt is not None:
+                    previous_model = self.model.name
+                    prepare_attempt(estimated_input + output_tokens)
+                    if self.model.name != previous_model:
+                        self.observe("model_switch", {"previous": previous_model, "model": self.model.name})
                 seconds_left = deadline - time.monotonic()
                 if seconds_left <= 0:
                     status, answer = "timeout", "已达到任务时间上限。"

@@ -1,0 +1,16 @@
+{
+  "quota_as_of": "2000-01-01T00:00:00+08:00",
+  "timezone_offset": "+08:00",
+  "base_url_env": "DASHSCOPE_BASE_URL",
+  "api_key_env": "DASHSCOPE_API_KEY",
+  "ledger": "quota-ledger.jsonl",
+  "safety_margin": 0.1,
+  "quota_error_codes": [],
+  "models": [
+    {"name": "deepseek-v4.1-flash", "quota_tokens": 0, "expires": "2026-12-13"},
+    {"name": "deepseek-v4.1-flash-1017", "quota_tokens": 0, "expires": "2027-01-17"},
+    {"name": "qwen3.8-max-0902", "quota_tokens": 0, "expires": "2026-12-01"},
+    {"name": "glm-5.3", "quota_tokens": 0, "expires": "2026-11-23", "reasoning_effort": "low"},
+    {"name": "qwen3.8-flash", "quota_tokens": 0, "expires": "2026-11-25"}
+  ]
+}

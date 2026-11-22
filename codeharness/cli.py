@@ -8,6 +8,7 @@ import sys
 import uuid
 
 from .demo import DemoModel, create_demo
+from .model_pool import ModelPool
 from .models import ChatModel
 from .runtime import Agent, Limits
 from .store import Store
@@ -91,6 +92,8 @@ def parser() -> argparse.ArgumentParser:
     execution = argparse.ArgumentParser(add_help=False)
     execution.add_argument("--env-file", type=Path, help="显式读取本地 NAME=value 配置，环境变量优先")
     execution.add_argument("--model", help="也可设置 CODEHARNESS_MODEL 或 OPENAI_MODEL")
+    execution.add_argument("--model-pool", type=Path, help="模型额度和台账配置 JSON")
+    execution.add_argument("--models", help="覆盖模型池顺序，使用逗号分隔")
     execution.add_argument("--reasoning-effort", help="模型支持时设置推理强度，例如 low")
     execution.add_argument("--base-url", help="兼容 Chat Completions 的地址，包含 /v1 等前缀")
     execution.add_argument("--allow-write", action="store_true", help="授权修改工作区文件")
@@ -166,7 +169,14 @@ def main(argv: list[str] | None = None) -> int:
                 model_name = model_name or row["model"]
             limits = Limits(args.max_requests, args.max_tokens, args.output_tokens, args.context_chars, args.max_seconds,
                             args.model_attempts)
-            if model_name == "offline-demo":
+            if args.models and not args.model_pool:
+                raise ValueError("--models 需要配合 --model-pool")
+            if args.model_pool:
+                if args.model or args.base_url:
+                    raise ValueError("--model-pool 使用池配置中的模型和接口地址")
+                model = ModelPool(args.model_pool, env=env, order=args.models,
+                                  reasoning_effort=args.reasoning_effort, switch_mid_session=True)
+            elif model_name == "offline-demo":
                 model = DemoModel()
             else:
                 base_url, key = model_connection(env, args.base_url)
@@ -195,6 +205,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[{'只读子任务' if data['readonly'] else '会话'}] {data['id']}", flush=True)
             elif kind == "tool":
                 print(f"[{data['session_id']}] {data['name']}", flush=True)
+            elif kind == "model_switch":
+                print(f"切换模型：{data['previous']} → {data['model']}", flush=True)
 
         result = Agent(model, workspace, store, policy, limits, plugins, observe,
                        enable_delegate=not getattr(args, "no_delegate", False)).run(task, session_id=sid)

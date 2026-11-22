@@ -246,9 +246,9 @@ git worktree remove D:\wt\ch-pre
 | 事项 | 状态 | 结果与证据 |
 | --- | --- | --- |
 | G1 glm-5.3 重复基线 | ☑ | `low`、输出上限 4096。[core r2](.codeharness/benchmarks/pre-glm-core-r2/report.json) 5/5，32 次，60,556 Token。[multi r2](.codeharness/benchmarks/pre-glm-multi-r2/report.json) 2/3，25 次，75,467 Token，`ledger-reconcile` 耗尽单题预算。合计 136,023 Token，按本轮用量再跑完整一轮会超过 G1 的 250K 总上限。两套件均未触发委派或压缩。 |
-| S0 | ◐ | [S0 summary](.codeharness/regress/s0-20261122-232004/summary.json)。Windows / Python 3.13.12，78 项中 77 通过、1 项符号链接因权限跳过，12/12 + 3/3 夹具通过，离线 demo 为 8/5 次请求且均 verified。CI 待验收。 |
-| S0b | ☐ | 冒烟结果；各轮报告目录、成功数、用量；推理强度设置；遇到的错误码 |
-| M0 | ☐ | 提交号；regress summary |
+| S0 | ☑ | 基线提交 `1a912f53c6749ba38d9b37e68a1eb129434e6151` 已推送。[S0 summary](.codeharness/regress/s0-20261122-232004/summary.json)。Windows / Python 3.13.12，78 项中 77 通过、1 项符号链接因权限跳过；12/12 + 3/3 夹具通过，离线 demo 为 8/5 次请求且均 verified。初次 CI 在 Windows 输出中文时编码失败，设置 UTF-8 后 [六个矩阵作业全部通过](https://github.com/twi66li/CodeHarness/actions/runs/45038344148)，日志和摘要均已上传。 |
+| S0b | ☑ | 在 `1a912f5` 使用 `deepseek-v4.1-flash` 默认推理强度。[冒烟](.codeharness/benchmarks/pre-ds-smoke/report.json) 1/1、10,570 Token。[core r1](.codeharness/benchmarks/pre-ds-core-r1/report.json) 5/5、82,107 Token。[multi r1](.codeharness/benchmarks/pre-ds-multi-r1/report.json) 3/3、102,124 Token。[core r2](.codeharness/benchmarks/pre-ds-core-r2/report.json) 5/5、77,937 Token。[multi r2](.codeharness/benchmarks/pre-ds-multi-r2/report.json) 先完成 1 题、36,506 Token。用户批准把 S0b 上限提高到 400K 后，只补跑了 [rbac-gateway](.codeharness/benchmarks/pre-ds-multi-r2-rbac-gateway/report.json) 和 [ledger-reconcile](.codeharness/benchmarks/pre-ds-multi-r2-ledger-reconcile/report.json)，独立验收均通过，分别用了 35,895 和 36,253 Token。两轮共 16/16，加冒烟共 111 次请求、381,392 Token，无模型错误或访问拒绝，委派 0 次，压缩 1 次。 |
+| M0 | ◐ | 用户已同意最小运行时改动。发起请求前选定模型，额度拒绝通过现有重试回路切换，按物理请求分别记模型和用量。 |
 | M0 实测 | ☐ | 两次运行使用的模型；status 输出 |
 | S1 | ☐ | |
 | S2 | ☐ | |
@@ -264,7 +264,7 @@ git worktree remove D:\wt\ch-pre
 | S12 | ☐ | |
 | S13 | ☐ | 各实验的报告目录、模型、n、主要结论 |
 | S14 | ☐ | |
-| 顺序调整 | — | 偏离执行总清单顺序时，记录原因 |
+| 顺序调整 | — | S0b 因原累计上限跳过两题，M0 开发期间经用户批准在固定基线上补齐。 |
 | 待用户决定 | — | |
 
 ### 2026-11-21 晚间评审修复与 `multi` 多模块真实评测收口

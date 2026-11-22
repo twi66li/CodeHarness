@@ -130,6 +130,16 @@ Where the endpoint supports it, `--reasoning-effort low` lowers reasoning effort
 
 Benchmark acceptance still executes model-written Python code locally; the independent acceptance directory is not a tamper-proof sandbox. Use only for trusted evaluation tasks.
 
+### Model quota pool
+
+Copy `models.example.json` to `.codeharness/models.json`, then set the quota snapshot time, token balances and expiry dates from your provider. Run `python -m codeharness.model_pool status` to view the balances. Worktrees can share a ledger by passing the same absolute configuration path.
+
+```powershell
+python -m codeharness.benchmark --mode model --task discount --model-pool .codeharness/models.json --models deepseek-v4.1-flash,deepseek-v4.1-flash-1017 --env-file .env --allow-exec --total-requests 12 --total-tokens 24000
+```
+
+Benchmark pairs run on one model. Quota exhaustion preserves the tokens already used and restarts the pair on another eligible model. `run` and `resume` also accept `--model-pool` and `--models`, and charge each actual request against the session budget. `sessions` shows the starting model, and `model_request` events in `trace` identify the model used for each request.
+
 ### Current results and limits
 
 | Item | Result | Notes |

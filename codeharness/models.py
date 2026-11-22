@@ -12,12 +12,16 @@ from urllib.request import Request, urlopen
 
 class ModelError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = False, retry_after: float | None = None,
-                 access_denied: bool = False, consume_output_budget: bool = True):
+                 access_denied: bool = False, consume_output_budget: bool = True,
+                 status: int | None = None, code: str | None = None, quota_exhausted: bool = False):
         super().__init__(message)
         self.retryable = retryable
         self.retry_after = retry_after
         self.access_denied = access_denied
         self.consume_output_budget = consume_output_budget
+        self.status = status
+        self.code = code
+        self.quota_exhausted = quota_exhausted
 
 
 def safe_error_tag(body: bytes, api_key: str) -> str:
@@ -31,7 +35,7 @@ def safe_error_tag(body: bytes, api_key: str) -> str:
         return ""
     for field in ("code", "type"):
         value = error.get(field)
-        if (isinstance(value, str) and 1 <= len(value) <= 64
+        if (isinstance(value, str) and 1 <= len(value) <= 64 and value.isascii()
                 and all(ch.isalnum() or ch in "_.-" for ch in value)
                 and (not api_key or api_key not in value)):
             return f" ({value})"
@@ -109,7 +113,8 @@ class ChatModel:
             raise ModelError(f"模型接口返回 HTTP {exc.code}{tag}", retryable=exc.code in {429, 500, 502, 503, 504},
                              retry_after=retry_delay(exc.headers.get("Retry-After") if exc.headers else None),
                              access_denied=exc.code in {401, 403},
-                             consume_output_budget=exc.code >= 500) from None
+                             consume_output_budget=exc.code >= 500, status=exc.code,
+                             code=tag[2:-1] if tag else None) from None
         except (URLError, TimeoutError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
             denied = isinstance(reason, PermissionError)

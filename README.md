@@ -130,6 +130,16 @@ python -m codeharness.benchmark --mode model --suite core --variants both --env-
 
 基准验收仍在本机执行模型编写的 Python 代码，独立验收目录不是防篡改安全沙箱。仅用于可信评测任务。
 
+### 模型额度池
+
+将 `models.example.json` 复制到 `.codeharness/models.json`。用供应商控制台更新 `quota_as_of`、`quota_tokens` 和到期日，然后执行 `python -m codeharness.model_pool status` 核对余额。多个工作树使用同一份配置和台账时，传入同一个绝对配置路径。
+
+```powershell
+python -m codeharness.benchmark --mode model --task discount --model-pool .codeharness/models.json --models deepseek-v4.1-flash,deepseek-v4.1-flash-1017 --env-file .env --allow-exec --total-requests 12 --total-tokens 24000
+```
+
+评测在同一模型内完成整组对照。额度耗尽时会记录已用量，并在另一可用模型上重新运行整组。`run` 和 `resume` 也接受 `--model-pool` 与 `--models`，会话预算按每次实际请求统计。`sessions` 显示会话开始时的模型，每次请求使用的模型可在 `trace` 的 `model_request` 中查看。
+
 ### 当前实测与边界
 
 | 评测项 | 结果 | 关键统计与说明 |
