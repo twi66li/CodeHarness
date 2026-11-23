@@ -101,7 +101,7 @@ A model adapter implements `complete(messages, tools, max_tokens, *, timeout=Non
 
 Test subprocesses and independent acceptance use an environment allowlist. `run` and `resume` accept `--pass-env NAME` for explicit process variables and warn for sensitive names. Workspace tools filter common private key and credential filenames.
 Untracked files ignored by Git stay out of file lists, search results and `changed_files`. `search` supports `regex` and `max_results`, and uses ripgrep for regular expressions when available.
-Use `apply_patch` with a unified diff for multi-hunk or multi-file edits. The tool validates every hunk before replacing files. Use `--disable-tool apply_patch` in `run`, `resume` or `benchmark` to omit it.
+Use `apply_patch` for multi-hunk or multi-file edits. A hunk with existing text can start with a standalone `@@` and use the usual space, `-`, and `+` prefixes. The old text must match exactly once. Pure insertions and new files require standard numbered hunk headers. The tool validates all hunks before replacing files. Use `--disable-tool apply_patch` in `run`, `resume` or `benchmark` to omit it.
 
 Five consecutive tool calls with identical arguments and results end the session with state `stalled` and CLI exit code 2. Use `trace` to view earlier warnings.
 

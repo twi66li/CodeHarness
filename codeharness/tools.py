@@ -136,9 +136,13 @@ def digest(content: bytes) -> str:
 
 def parse_unified_patch(patch: str):
     lines = patch.replace("\r\n", "\n").splitlines(keepends=True)
+    last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
+    if last is not None and lines[last].rstrip("\n") == "*** End Patch":
+        lines = lines[:last]
+    metadata = ("diff --git ", "index ", "new file mode ", "deleted file mode ")
     index = 0
     while index < len(lines):
-        if not lines[index].strip() or lines[index].startswith(("diff --git ", "index ", "new file mode ", "deleted file mode ")):
+        if not lines[index].strip() or lines[index].startswith(metadata):
             index += 1
             continue
         if index + 1 >= len(lines) or not lines[index].startswith("--- ") or not lines[index + 1].startswith("+++ "):
@@ -154,16 +158,24 @@ def parse_unified_patch(patch: str):
         index += 2
         hunks = []
         while index < len(lines) and lines[index].startswith("@@"):
-            header = re.fullmatch(r"@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@.*", lines[index].rstrip("\n"))
-            if header is None:
+            head = lines[index].rstrip("\n")
+            header = re.fullmatch(r"@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@.*", head)
+            if header is None and head != "@@":
                 raise ToolError(f"{old} 的补丁片段头无效")
-            offset, before_count, after_count = (int(part) if part is not None else 1 for part in header.groups())
+            offset = before_count = after_count = 0
+            if header:
+                offset, before_count, after_count = (int(part) if part is not None else 1 for part in header.groups())
             index += 1
             before, after = [], []
-            while len(before) < before_count or len(after) < after_count:
-                if index == len(lines):
-                    raise ToolError(f"{old} 的补丁片段行数与声明不符")
+            while index < len(lines):
                 raw = lines[index]
+                if header:
+                    if len(before) >= before_count and len(after) >= after_count:
+                        break
+                elif (raw.startswith(("@@", *metadata))
+                      or (raw.startswith("--- ") and index + 2 < len(lines)
+                          and lines[index + 1].startswith("+++ ") and lines[index + 2].startswith("@@"))):
+                    break
                 if raw == "\n":
                     raw = " \n"
                 sign, line = raw[0], raw[1:]
@@ -179,8 +191,10 @@ def parse_unified_patch(patch: str):
                     before.append(line)
                 if sign != "-":
                     after.append(line)
-            if len(before) != before_count or len(after) != after_count or not (before or after):
+            if header and (len(before) != before_count or len(after) != after_count or not (before or after)):
                 raise ToolError(f"{old} 的补丁片段行数无效")
+            if not header and not before:
+                raise ToolError(f"{old} 的无行号片段须包含可唯一匹配的原文；纯插入请使用带行号的片段")
             hunks.append((offset, before, after))
         if not hunks:
             raise ToolError(f"{old} 没有补丁片段")
@@ -639,8 +653,11 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None):
             ["path", "old_text", "new_text", "expected_sha256"]), edit_file, "write"),
         Tool("write_file", "仅用于创建尚不存在的新文件；修改已有文件必须使用 edit_file。", parameters({
             "path": string("相对文件路径"), "content": string("文件内容")}, ["path", "content"]), write_file, "write"),
-        Tool("apply_patch", "应用多片段或多文件的统一 diff。先读取文件，原文片段必须唯一匹配。",
-             parameters({"patch": string("统一 diff，包含 ---、+++ 与 @@ 片段头")}, ["patch"]), apply_patch, "write"),
+        Tool("apply_patch", "一次修改多处。先读取原文，每个片段必须唯一匹配；失败时可改用 edit_file。",
+             parameters({"patch": string("每个文件用 --- 路径、+++ 路径。已有原文的修改优先使用独立的 @@ 行，"
+                                           "然后写带前缀的正文：空格为上下文，- 删除，+ 新增。"
+                                           "例如 --- a.py\n+++ a.py\n@@\n-old = 1\n+old = 2\n。"
+                                           "纯插入或新建使用带起点和行数的标准统一 diff。")}, ["patch"]), apply_patch, "write"),
         Tool("run_tests", "在工作区运行测试，最多 60 秒；会执行项目代码，需要执行授权。", parameters({
             "path": string("测试目录或测试文件，默认 tests"),
             "runner": {"type": "string", "enum": ["unittest", "pytest"]}}), run_tests, "execute"),

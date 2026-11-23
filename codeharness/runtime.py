@@ -111,8 +111,11 @@ class Agent:
                     return {"session_id": child.session_id, "status": child.status,
                             "summary": child.answer[:6000], "usage": child.usage}
 
-                registry.register(Tool("delegate", "委派只读代码探索；独立上下文，共享总预算，最多 6 次模型请求。", parameters({
-                    "task": string("明确的调查目标与需要返回的证据")}, ["task"]), delegate, "delegate"))
+                registry.register(Tool("delegate", "把一条独立的只读调查交给子任务。若要比较多份同名实现、追踪多条调用链"
+                                       "或分页调查大型模块，优先委派其中一个明确的问题，再用结论定位并修改。"
+                                       "子任务有独立上下文，共享总预算，最多 6 次模型请求。", parameters({
+                    "task": string("仅委派一个调查目标，要求返回活跃文件路径、函数或测试证据及简要结论")}, ["task"]),
+                    delegate, "delegate"))
             for index, path in enumerate(self.plugins):
                 spec = importlib.util.spec_from_file_location(f"codeharness_extension_{index}", path)
                 if not spec or not spec.loader:

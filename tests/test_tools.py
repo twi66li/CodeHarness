@@ -70,6 +70,32 @@ class ToolTests(unittest.TestCase):
             registry.invoke("apply_patch", {"patch": "--- a.txt\n+++ a.txt\n@@ -1,3 +1,3 @@\n first\n\n-old\n+new\n"})
             self.assertEqual(path.read_text(encoding="utf-8"), "first\n\nnew\n")
 
+    def test_unified_patch_supports_multiple_exact_match_hunks_without_line_counts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first, second = root / "a.txt", root / "b.txt"
+            first.write_text("old heading\nunchanged\nold ending\n", encoding="utf-8")
+            second.write_text("old\n", encoding="utf-8")
+            registry = Registry(Workspace(root), Policy(allow_write=True))
+            register_workspace_tools(registry)
+            patch_text = ("--- a/a.txt\n+++ b/a.txt\n@@\n-old heading\n+heading\n@@\n-old ending\n+ending\n"
+                          "--- a/b.txt\n+++ b/b.txt\n@@\n-old\n+new\n*** End Patch\n")
+            registry.invoke("apply_patch", {"patch": patch_text})
+            self.assertEqual(first.read_text(encoding="utf-8"), "heading\nunchanged\nending\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "new\n")
+
+    def test_unified_patch_rejects_unnumbered_insert_and_wrong_numbered_counts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "a.txt"
+            path.write_text("old\n", encoding="utf-8")
+            registry = Registry(Workspace(root), Policy(allow_write=True))
+            register_workspace_tools(registry)
+            for hunk in ("@@\n+new\n", "@@ -1,2 +1 @@\n-old\n+new\n"):
+                with self.subTest(hunk=hunk), self.assertRaises(ToolError):
+                    registry.invoke("apply_patch", {"patch": "--- a.txt\n+++ a.txt\n" + hunk})
+                self.assertEqual(path.read_text(encoding="utf-8"), "old\n")
+
     def test_unified_patch_exclusively_creates_and_rolls_back_without_hard_links(self):
         create = "--- /dev/null\n+++ new.txt\n@@ -0,0 +1 @@\n+created\n"
         edit = "--- old.txt\n+++ old.txt\n@@ -1 +1 @@\n-old\n+new\n"
