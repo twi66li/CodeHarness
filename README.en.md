@@ -186,6 +186,10 @@ Benchmark pairs run on one model. Quota exhaustion preserves the tokens already 
 
 The model made zero delegation calls across the six runs where the tool was available. In the threshold experiment, compactions increased from 14 to 40 and the median paired request difference was +4. These small samples inform follow-up investigation. The deterministic demo validates the execution path in 8 requests with delegation and 5 without. Use the evaluation commands above to reproduce the runs. Reports are saved locally under `.codeharness/benchmarks/`.
 
+**Magpie follow-up (2026-11-24).** We ran the three `multi` tasks twice on `workbuddy/deepseek-v4.1-flash`. With the revised patch syntax, patch outcomes changed from 0 successes and 6 failures to 4 successes and 1 failure. Both versions passed 6/6 independent checks. On the new version, enabling and disabling patches both passed 6/6, with 59 and 55 requests respectively. These pairs use the same Magpie route.
+
+The original large-repository prompts still produced no spontaneous delegation. When explicitly asked to delegate a single-file investigation, the model invoked `delegate`. The child completed one read-only search in two model requests and returned call-site evidence. The parent passed independent acceptance. This run verifies the live delegation path. Its performance benefit remains unmeasured.
+
 Use `python -m unittest discover -s tests -v` for a full regression. If local loopback connections are forbidden, set `$env:CODEHARNESS_SKIP_LOOPBACK='1'` in PowerShell to explicitly skip the 5 real local HTTP integration tests; simulated transport and CLI tool-chain tests still run. That mode is not a full network regression.
 
 `python -B scripts/regress.py --tag <tag>` runs unit tests, the `full`, `multi` and `large` reference fixtures, and the offline demo with and without delegation. Logs and results go to `.codeharness/regress/`. Use `--compare <summary.json>` to compare with an earlier run and `--skip-loopback` as an alternative to setting the environment variable above. CI runs the same script on Ubuntu and Windows with Python 3.11–3.13.

@@ -184,6 +184,10 @@ python -m codeharness.benchmark --mode model --task discount --model-pool .codeh
 
 开放委派的 6 次运行均未实际调用该工具。压缩阈值实验中，压缩次数从 14 增至 40，请求差中位数为 +4。这些小样本观察用于确定下一轮排查范围。确定性 demo（委派开 8 次请求、关 5 次）用于验证执行链路。可使用上方评测命令复现，本地报告保存在 `.codeharness/benchmarks/`。
 
+**Magpie 续测（2026-11-24）**。使用 `workbuddy/deepseek-v4.1-flash` 在 `multi` 三题各跑两轮。改进补丁语法后，补丁调用从 0 次成功、6 次失败变为 4 次成功、1 次失败，两版独立验收均为 6/6。新版启用、禁用补丁也都是 6/6，请求总数分别为 59 和 55。这组结果只在 Magpie 渠道内配对。
+
+同渠道的大仓库原题仍未出现自发委派。显式要求单文件调查时，模型调用了 `delegate`，子任务用 2 次请求完成 1 次只读搜索并返回调用证据，主任务通过独立验收。这条记录验证了真实执行链路，委派收益仍待测量。
+
 正常环境使用 `python -m unittest discover -s tests -v` 完整回归。如果明确禁止本地回环连接，可以在 PowerShell 设置 `$env:CODEHARNESS_SKIP_LOOPBACK='1'`，显式跳过 5 项真实本地 HTTP 集成测试；模拟传输与 CLI 工具链测试仍然运行。该模式不等同于完整网络回归。
 
 `python -B scripts/regress.py --tag <标签>` 运行单元测试、`full`、`multi`、`large` 参考夹具及启用、禁用委派的离线 demo。结果与日志写入 `.codeharness/regress/`。`--compare <summary.json>` 与之前的结果对比，`--skip-loopback` 等同于上面的环境变量。CI 在 Ubuntu 与 Windows、Python 3.11～3.13 上运行同一脚本。
