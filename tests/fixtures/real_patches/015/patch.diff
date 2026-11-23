@@ -1,0 +1,53 @@
+--- app/validators.py
++++ app/validators.py
+@@ -1,7 +1,23 @@
++VALID_SIDES = ("debit", "credit")
++
++
+ def validate_voucher(entries):
+     if not entries:
+         raise ValueError("empty voucher")
++    for entry in entries:
++        if entry.side not in VALID_SIDES:
++            raise ValueError(f"invalid entry side: {entry.side!r}")
++        try:
++            positive = entry.amount > 0
++        except TypeError:
++            raise ValueError(f"invalid amount: {entry.amount!r}") from None
++        if not positive:
++            raise ValueError(f"non-positive amount: {entry.amount!r}")
+     debit = sum(e.amount for e in entries if e.side == "debit")
+     credit = sum(e.amount for e in entries if e.side == "credit")
+     if debit != credit:
+         raise ValueError("unbalanced voucher")
++    return True
+--- app/posting.py
++++ app/posting.py
+@@ -9,6 +9,9 @@
+         self.external_totals = {}
+ 
+     def post(self, ref, entries, idempotency_key=None):
++        # Idempotent replay: same key returns the original voucher untouched.
++        if idempotency_key is not None and idempotency_key in self.by_key:
++            return self.by_key[idempotency_key]
+         validate_voucher(entries)
+         apply_entries(self.balances, entries)
+         amount = sum(e.amount for e in entries if e.side == "debit")
+--- app/reconcile.py
++++ app/reconcile.py
+@@ -1,9 +1,15 @@
+ def reconcile(vouchers, external_records):
+     diffs = []
+     ext_map = {row["ref"]: row["amount"] for row in external_records}
+     for ref, voucher in vouchers.items():
++        ledger_amount = voucher["amount"] if isinstance(voucher, dict) else voucher
+         if ref not in ext_map:
+             diffs.append({"ref": ref, "kind": "missing_in_external"})
+-        elif ext_map[ref] != voucher["amount"]:
++        elif ext_map[ref] != ledger_amount:
+             diffs.append({"ref": ref, "kind": "amount_mismatch"})
++    for ref in ext_map:
++        if ref not in vouchers:
++            diffs.append({"ref": ref, "kind": "missing_in_ledger"})
++    diffs.sort(key=lambda diff: diff["ref"])
+     return diffs

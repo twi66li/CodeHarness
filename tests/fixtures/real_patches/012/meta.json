@@ -1,0 +1,6 @@
+{
+  "case": "ledger-reconcile",
+  "session_path": "magpie-e4-before/ledger-reconcile/no-delegate/r1/state.sqlite3",
+  "error": "app/posting.py 的补丁片段行数与声明不符",
+  "skip_reason": null
+}

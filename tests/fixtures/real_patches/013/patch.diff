@@ -1,0 +1,41 @@
+--- a/app/coupons.py
++++ b/app/coupons.py
+@@ -1,6 +1,8 @@
+ def discount_cents(subtotal, coupon):
+     if coupon is None:
+         return 0
+-    if subtotal > coupon.threshold:
+-        return coupon.amount
++    if subtotal >= coupon.threshold:
++        # 优惠金额不能超过商品小计，保证折后金额不为负
++        return max(0, min(coupon.amount, subtotal))
+     return 0
+--- a/app/tax.py
++++ b/app/tax.py
+@@ -1,3 +1,4 @@
+ def calculate_tax(subtotal, discount, rate_bps):
+-    taxable = subtotal
++    # 计税基数 = 扣除优惠券后的金额，且不能为负
++    taxable = max(0, subtotal - discount)
+     return (taxable * rate_bps + 5000) // 10000
+--- a/app/pipeline.py
++++ b/app/pipeline.py
+@@ -11,7 +11,18 @@
+     net = subtotal - discount
+     tax = calculate_tax(subtotal, discount, tax_bps)
+     shipping = shipping_cents(net)
+-    reserve(stock, items)
++    if not reserve(stock, items):
++        return {
++            "order_id": order_id,
++            "status": "rejected",
++            "subtotal": subtotal,
++            "discount": discount,
++            "tax": tax,
++            "shipping": shipping,
++            "total": net + tax + shipping,
++        }
+     order = {
+         "order_id": order_id,
+         "status": "confirmed",
+*** End Patch

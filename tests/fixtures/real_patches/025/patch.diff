@@ -1,0 +1,66 @@
+--- a/app/roles.py
++++ b/app/roles.py
+@@ -1,4 +1,12 @@
+ def expand_roles(direct_roles, hierarchy):
+-    result = set(direct_roles)
+-    for role in list(direct_roles):
+-        result.update(hierarchy.get(role, ()))
++    hierarchy = hierarchy or {}
++    result = set()
++    pending = list(direct_roles or ())
++
++    while pending:
++        role = pending.pop()
++        if role in result:
++            continue
++        result.add(role)
++        pending.extend(hierarchy.get(role, ()))
++
+     return result
+--- a/app/policies.py
++++ b/app/policies.py
+@@ -1,6 +1,17 @@
+ def evaluate(roles, rules, resource, action):
+-    decision = False
+-    for rule in rules:
+-        if rule.role in roles and rule.resource in {resource, "*"} and rule.action in {action, "*"}:
+-            decision = rule.effect == "allow"
+-    return decision
++    allowed = False
++
++    for rule in rules or ():
++        if rule.role not in roles:
++            continue
++        if rule.resource not in {resource, "*"}:
++            continue
++        if rule.action not in {action, "*"}:
++            continue
++
++        if rule.effect == "deny":
++            return False
++        if rule.effect == "allow":
++            allowed = True
++
++    return allowed
+--- a/app/gateway.py
++++ b/app/gateway.py
+@@ -3,6 +3,7 @@
+ from app.policies import evaluate
+ from app.ratelimit import within_limit
+ from app.roles import expand_roles
++from app.tenant import is_same_tenant
+ from app.tokens import is_valid
+ 
+ def authorize(token, request, hierarchy, rules, audit_events, rate_counters=None, limit=100, stats=None):
+@@ -11,6 +12,10 @@
+             count_decision(stats, False)
+         return {"allowed": False, "reason": "invalid_token"}
++    if not is_same_tenant(token, request):
++        log_decision(audit_events, token.subject, request.tenant_id, False, "cross_tenant")
++        if stats is not None:
++            count_decision(stats, False)
++        return {"allowed": False, "reason": "cross_tenant"}
+     if rate_counters is not None and not within_limit(rate_counters, token.subject, limit):
+         log_decision(audit_events, token.subject, request.tenant_id, False, "rate_limited")
+         if stats is not None:
+--- End Patch

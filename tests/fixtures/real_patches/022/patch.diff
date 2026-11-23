@@ -1,0 +1,90 @@
+--- a/app/roles.py
++++ b/app/roles.py
+@@ -1,5 +1,18 @@
+ def expand_roles(direct_roles, hierarchy):
+-    result = set(direct_roles)
+-    for role in list(direct_roles):
+-        result.update(hierarchy.get(role, ()))
+-    return result
++    """Expand direct roles into the full transitive set of effective roles.
++
++    Inheritance is followed through ``hierarchy`` until no new role is
++    discovered.  ``visited`` guards against cyclic hierarchies
++    (e.g. ``{"a": ("b",), "b": ("a",)}``) so expansion always terminates.
++    """
++    result = set()
++    pending = list(direct_roles or ())
++    visited = set()
++    while pending:
++        role = pending.pop()
++        if role in visited:
++            continue
++        visited.add(role)
++        result.add(role)
++        pending.extend(hierarchy.get(role, ()) or ())
++    return result
+--- a/app/policies.py
++++ b/app/policies.py
+@@ -1,6 +1,32 @@
++ALLOW = "allow"
++DENY = "deny"
++
++
++def _matches(rule, resource, action):
++    return rule.resource in {resource, "*"} and rule.action in {action, "*"}
++
++
++def _effect(rule):
++    return str(rule.effect or "").strip().lower()
++
++
+ def evaluate(roles, rules, resource, action):
+-    decision = False
++    """Decide whether ``roles`` may perform ``action`` on ``resource``.
++
++    An explicit ``deny`` rule always wins over ``allow`` rules: rule order is
++    irrelevant, so a single matching deny vetoes every matching allow.  Access
++    defaults to denied when no rule matches.
++    """
++    role_set = set(roles or ())
++    allowed = False
+     for rule in rules:
+-        if rule.role in roles and rule.resource in {resource, "*"} and rule.action in {action, "*"}:
+-            decision = rule.effect == "allow"
+-    return decision
++        if rule.role not in role_set or not _matches(rule, resource, action):
++            continue
++        effect = _effect(rule)
++        if effect == DENY:
++            # Explicit deny is final and cannot be overridden by allow rules.
++            return False
++        if effect == ALLOW:
++            allowed = True
++    return allowed
+--- a/app/gateway.py
++++ b/app/gateway.py
+@@ -1,7 +1,8 @@
+ from app.audit import log_decision
+ from app.metrics import count_decision
+ from app.policies import evaluate
+ from app.ratelimit import within_limit
+ from app.roles import expand_roles
++from app.tenant import is_same_tenant
+ from app.tokens import is_valid
+ 
+ def authorize(token, request, hierarchy, rules, audit_events, rate_counters=None, limit=100, stats=None):
+@@ -13,6 +14,14 @@
+             count_decision(stats, False)
+         return {"allowed": False, "reason": "invalid_token"}
++    # Cross-tenant access is rejected up front: a token may only act inside its
++    # own tenant, so no further policy or quota evaluation happens.
++    if not is_same_tenant(token, request):
++        log_decision(audit_events, token.subject, request.tenant_id, False, "cross_tenant_denied")
++        if stats is not None:
++            count_decision(stats, False)
++        return {"allowed": False, "reason": "cross_tenant_denied"}
+     if rate_counters is not None and not within_limit(rate_counters, token.subject, limit):
+         log_decision(audit_events, token.subject, request.tenant_id, False, "rate_limited")
+         if stats is not None:
+             count_decision(stats, False)
+         return {"allowed": False, "reason": "rate_limited"}

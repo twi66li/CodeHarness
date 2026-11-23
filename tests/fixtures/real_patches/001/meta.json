@@ -1,0 +1,6 @@
+{
+  "case": "large-order-pipeline",
+  "session_path": "magpie-e2-before/large-order-pipeline/delegate/state.sqlite3",
+  "error": "补丁第 1 行缺少成对的文件头",
+  "skip_reason": null
+}

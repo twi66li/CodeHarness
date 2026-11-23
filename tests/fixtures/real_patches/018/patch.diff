@@ -1,0 +1,24 @@
+--- inventory.py
++++ inventory.py
+@@
+ def reserve(stock, item, qty):
+-    if stock.get(item, 0) <= qty:
++    if qty <= 0:
+         return False
+-    stock[item] -= qty
++    available = stock.get(item, 0)
++    if available < qty:
++        return False
++    stock[item] = available - qty
+     return True
+--- orders.py
++++ orders.py
+@@
+ from inventory import reserve
+ 
+ def place(stock, item, qty):
+-    reserve(stock, item, qty)
+-    return 'accepted'
++    if reserve(stock, item, qty):
++        return 'accepted'
++    return 'out_of_stock'

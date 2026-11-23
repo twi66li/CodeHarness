@@ -1,0 +1,19 @@
+--- paging.py
++++ paging.py
+@@
+ def page(items, number, size):
+-    start = number * size
+-    return items[start:start + size]
++    if number < 1 or size < 1:
++        return []
++    start = (number - 1) * size
++    return items[start:start + size]
+--- catalog.py
++++ catalog.py
+@@
+ from paging import page
+ 
+ def list_items(items, number, size):
+-    return page(sorted(items, reverse=True), number, size)
++    return page(sorted(items), number, size)
+*** End Patch

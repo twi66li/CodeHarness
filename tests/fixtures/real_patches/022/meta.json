@@ -1,0 +1,6 @@
+{
+  "case": "rbac-gateway",
+  "session_path": "s13-e1-multi/rbac-gateway/delegate/r1-deepseek-v4.1-flash/state.sqlite3",
+  "error": "app/policies.py 的补丁片段行数无效",
+  "skip_reason": null
+}

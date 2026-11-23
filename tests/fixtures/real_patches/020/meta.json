@@ -1,0 +1,6 @@
+{
+  "case": "order-pipeline",
+  "session_path": "s13-e1-multi/order-pipeline/delegate/r1-deepseek-v4.1-flash/state.sqlite3",
+  "error": "补丁第 45 行缺少成对的文件头",
+  "skip_reason": null
+}

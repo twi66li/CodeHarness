@@ -1,0 +1,55 @@
+--- app/roles.py
++++ app/roles.py
+@@
+ def expand_roles(direct_roles, hierarchy):
+-    result = set(direct_roles)
+-    for role in list(direct_roles):
+-        result.update(hierarchy.get(role, ()))
++    """Transitively expand roles, tolerating cycles in the hierarchy."""
++    result = set()
++    pending = list(direct_roles)
++    while pending:
++        role = pending.pop()
++        if role in result:
++            continue
++        result.add(role)
++        pending.extend(hierarchy.get(role, ()))
+     return result
+--- app/policies.py
++++ app/policies.py
+@@
+ def evaluate(roles, rules, resource, action):
+-    decision = False
++    allowed = False
+     for rule in rules:
+         if rule.role in roles and rule.resource in {resource, "*"} and rule.action in {action, "*"}:
+-            decision = rule.effect == "allow"
+-    return decision
++            if rule.effect == "deny":
++                return False
++            if rule.effect == "allow":
++                allowed = True
++    return allowed
+--- app/gateway.py
++++ app/gateway.py
+@@
+ from app.roles import expand_roles
++from app.tenant import is_same_tenant
+ from app.tokens import is_valid
+@@
+     if not is_valid(token):
+         log_decision(audit_events, "", request.tenant_id, False, "invalid_token")
+         if stats is not None:
+             count_decision(stats, False)
+         return {"allowed": False, "reason": "invalid_token"}
++    if not is_same_tenant(token, request):
++        log_decision(audit_events, token.subject, request.tenant_id, False, "tenant_mismatch")
++        if stats is not None:
++            count_decision(stats, False)
++        return {"allowed": False, "reason": "tenant_mismatch"}
+     if rate_counters is not None and not within_limit(rate_counters, token.subject, limit):
+         log_decision(audit_events, token.subject, request.tenant_id, False, "rate_limited")
+         if stats is not None:
+             count_decision(stats, False)
+         return {"allowed": False, "reason": "rate_limited"}
+*** End Patch

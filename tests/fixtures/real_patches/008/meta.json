@@ -1,0 +1,6 @@
+{
+  "case": "large-ledger-reconcile",
+  "session_path": "magpie-e2-guidance/large-ledger-reconcile/delegate/state.sqlite3",
+  "error": "app/reconcile.py 的补丁片段行数无效",
+  "skip_reason": null
+}

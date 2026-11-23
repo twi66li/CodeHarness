@@ -1,0 +1,21 @@
+--- a/money.py
++++ b/money.py
+@@ -1,4 +1,4 @@
+-from decimal import Decimal, ROUND_DOWN
++from decimal import Decimal, ROUND_HALF_UP
+ 
+ def cents(value):
+-    return value.quantize(Decimal('0.01'), rounding=ROUND_DOWN)
++    return value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+--- a/invoice.py
++++ b/invoice.py
+@@ -1,5 +1,5 @@
+ from decimal import Decimal
+ from money import cents
+ 
+-def total(items, shipping=Decimal('0')):
+-    return cents(sum(items, Decimal('0')))
++def total(items, shipping=Decimal('0')):
++    subtotal = sum((Decimal(item) for item in items), Decimal('0'))
++    return cents(subtotal + Decimal(shipping))
+*** End Patch

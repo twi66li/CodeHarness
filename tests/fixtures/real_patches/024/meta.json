@@ -1,0 +1,6 @@
+{
+  "case": "order-pipeline",
+  "session_path": "s13-e1-multi/order-pipeline/delegate/r2-deepseek-v4.1-flash/state.sqlite3",
+  "error": "app/coupons.py 的补丁片段行数与声明不符",
+  "skip_reason": null
+}

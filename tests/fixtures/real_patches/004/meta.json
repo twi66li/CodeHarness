@@ -1,0 +1,6 @@
+{
+  "case": "large-order-pipeline",
+  "session_path": "magpie-e2-before/large-order-pipeline/no-delegate/state.sqlite3",
+  "error": "app/pipeline.py 的补丁片段行数与声明不符",
+  "skip_reason": null
+}

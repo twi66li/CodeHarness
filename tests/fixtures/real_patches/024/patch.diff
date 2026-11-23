@@ -1,0 +1,80 @@
+--- a/app/coupons.py
++++ b/app/coupons.py
+@@ -1,6 +1,10 @@
+ def discount_cents(subtotal, coupon):
+     if coupon is None:
+         return 0
+-    if subtotal > coupon.threshold:
+-        return coupon.amount
+-    return 0
++    # 达到阈值（含等于）即可使用；优惠金额不能为负，
++    # 且不得高于小计，保证折后金额不低于 0。
++    if subtotal >= coupon.threshold:
++        return max(0, min(coupon.amount, subtotal))
++    return 0
+--- a/app/tax.py
++++ b/app/tax.py
+@@ -1,3 +1,4 @@
+ def calculate_tax(subtotal, discount, rate_bps):
+-    taxable = subtotal
++    # 计税基数为扣除优惠券后的金额，且不为负。
++    taxable = max(0, subtotal - discount)
+     return (taxable * rate_bps + 5000) // 10000
+--- a/app/inventory.py
++++ b/app/inventory.py
+@@ -1,7 +1,13 @@
+ def reserve(stock, items):
++    required = {}
+     for item in items:
+-        if item.qty <= 0 or stock.get(item.sku, 0) < item.qty:
++        if item.qty <= 0:
+             return False
+-    for item in items:
+-        stock[item.sku] -= item.qty
++        required[item.sku] = required.get(item.sku, 0) + item.qty
++    # 同一 SKU 可能出现在多个行项中，需按合计需求量校验，避免超卖。
++    for sku, qty in required.items():
++        if stock.get(sku, 0) < qty:
++            return False
++    for sku, qty in required.items():
++        stock[sku] -= qty
+     return True
+--- a/app/pipeline.py
++++ b/app/pipeline.py
+@@ -6,19 +6,27 @@
+ from app.tax import calculate_tax
+ 
+ def submit_order(order_id, items, stock, audit_log, coupon=None, tax_bps=1000):
+-    subtotal = subtotal_cents(items)
+-    discount = discount_cents(subtotal, coupon)
+-    net = subtotal - discount
+-    tax = calculate_tax(subtotal, discount, tax_bps)
+-    shipping = shipping_cents(net)
+-    reserve(stock, items)
++    subtotal = subtotal_cents(items)
++    discount = discount_cents(subtotal, coupon)
++    net = max(0, subtotal - discount)
++    tax = calculate_tax(subtotal, discount, tax_bps)
++    shipping = shipping_cents(net)
+     order = {
+         "order_id": order_id,
+-        "status": "confirmed",
++        "status": "confirmed",
+         "subtotal": subtotal,
+         "discount": discount,
+         "tax": tax,
+         "shipping": shipping,
+         "total": net + tax + shipping,
+     }
++    # 库存不足时订单不得确认，也不记录 confirmed 审计事件。
++    if not reserve(stock, items):
++        order["status"] = "rejected"
++        return order
+     record(audit_log, "confirmed", order_id, order["total"])
+     return order
+--- a/app/__init__.py
++++ b/app/__init__.py
+@@ -1 +1 @@
+-
++
+*** End Patch

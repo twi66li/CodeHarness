@@ -1,0 +1,76 @@
+--- app/validators.py
++++ app/validators.py
+@@ -1,7 +1,24 @@
++"""凭证校验：金额必须为正，且借贷必须平衡。"""
++
++VALID_SIDES = ("debit", "credit")
++
++
+ def validate_voucher(entries):
+     if not entries:
+         raise ValueError("empty voucher")
+-    debit = sum(e.amount for e in entries if e.side == "debit")
+-    credit = sum(e.amount for e in entries if e.side == "credit")
++    debit = 0
++    credit = 0
++    for entry in entries:
++        if entry.side not in VALID_SIDES:
++            raise ValueError(f"invalid entry side: {entry.side!r}")
++        amount = entry.amount
++        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
++            raise ValueError(f"entry amount must be numeric: {amount!r}")
++        if amount <= 0:
++            raise ValueError(f"entry amount must be positive: {amount!r}")
++        if entry.side == "debit":
++            debit += amount
++        else:
++            credit += amount
+     if debit != credit:
+         raise ValueError("unbalanced voucher")
+--- app/posting.py
++++ app/posting.py
+@@ -8,13 +8,24 @@
+         self.by_key = {}
+         self.external_totals = {}
+ 
+     def post(self, ref, entries, idempotency_key=None):
++        entries = list(entries)
++        # 幂等：同一 idempotency_key 直接返回原凭证，不再校验/记账/改余额
++        if idempotency_key is not None:
++            existing = self.by_key.get(idempotency_key)
++            if existing is not None:
++                return existing
+         validate_voucher(entries)
+         apply_entries(self.balances, entries)
+         amount = sum(e.amount for e in entries if e.side == "debit")
+         voucher = {"ref": ref, "amount": amount, "entries": list(entries)}
+         self.vouchers[ref] = voucher
+         if idempotency_key is not None:
+             self.by_key[idempotency_key] = voucher
+         return voucher
+--- app/reconcile.py
++++ app/reconcile.py
+@@ -1,9 +1,25 @@
++"""对账：比较账本凭证与外部记录，输出按 ref 升序的差异列表。"""
++
++
++def _amount_of(voucher):
++    if isinstance(voucher, dict):
++        return voucher.get("amount")
++    return getattr(voucher, "amount", None)
++
++
+ def reconcile(vouchers, external_records):
+     diffs = []
+     ext_map = {row["ref"]: row["amount"] for row in external_records}
+-    for ref, voucher in vouchers.items():
+-        if ref not in ext_map:
++    for ref in sorted(set(vouchers) | set(ext_map)):
++        if ref not in vouchers:
++            diffs.append({"ref": ref, "kind": "missing_in_ledger"})
++        elif ref not in ext_map:
+             diffs.append({"ref": ref, "kind": "missing_in_external"})
+-        elif ext_map[ref] != voucher["amount"]:
++        elif ext_map[ref] != _amount_of(vouchers[ref]):
+             diffs.append({"ref": ref, "kind": "amount_mismatch"})
+     return diffs

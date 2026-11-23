@@ -1,0 +1,6 @@
+{
+  "case": "inventory",
+  "session_path": "s13-e1-core/inventory/delegate/r2-deepseek-v4.1-flash/state.sqlite3",
+  "error": "inventory.py 的补丁片段头无效",
+  "skip_reason": null
+}

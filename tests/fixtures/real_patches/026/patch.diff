@@ -1,0 +1,41 @@
+--- a/app/validators.py
++++ b/app/validators.py
+@@
+ def validate_voucher(entries):
+     if not entries:
+         raise ValueError("empty voucher")
++    for entry in entries:
++        if entry.amount <= 0:
++            raise ValueError(f"non-positive amount: {entry.amount!r}")
+     debit = sum(e.amount for e in entries if e.side == "debit")
+     credit = sum(e.amount for e in entries if e.side == "credit")
+     if debit != credit:
+         raise ValueError("unbalanced voucher")
+--- a/app/posting.py
++++ b/app/posting.py
+@@
+     def post(self, ref, entries, idempotency_key=None):
++        if idempotency_key is not None and idempotency_key in self.by_key:
++            return self.by_key[idempotency_key]
+         validate_voucher(entries)
+         apply_entries(self.balances, entries)
+--- a/app/reconcile.py
++++ b/app/reconcile.py
+@@
+ def reconcile(vouchers, external_records):
+     diffs = []
+     ext_map = {row["ref"]: row["amount"] for row in external_records}
+     for ref, voucher in vouchers.items():
+         if ref not in ext_map:
+             diffs.append({"ref": ref, "kind": "missing_in_external"})
+         elif ext_map[ref] != voucher["amount"]:
+             diffs.append({"ref": ref, "kind": "amount_mismatch"})
++    for ref in ext_map:
++        if ref not in vouchers:
++            diffs.append({"ref": ref, "kind": "missing_in_ledger"})
++    try:
++        diffs.sort(key=lambda d: d["ref"])
++    except TypeError:
++        diffs.sort(key=lambda d: str(d["ref"]))
+     return diffs
+*** End Patch

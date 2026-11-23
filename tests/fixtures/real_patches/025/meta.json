@@ -1,0 +1,6 @@
+{
+  "case": "rbac-gateway",
+  "session_path": "s13-e1-multi/rbac-gateway/delegate/r2-deepseek-v4.1-flash/state.sqlite3",
+  "error": "补丁第 19 行缺少成对的文件头",
+  "skip_reason": null
+}
