@@ -146,7 +146,7 @@ def parse_unified_patch(patch: str):
             index += 1
             continue
         if index + 1 >= len(lines) or not lines[index].startswith("--- ") or not lines[index + 1].startswith("+++ "):
-            raise ToolError(f"补丁第 {index + 1} 行缺少成对的文件头")
+            raise ToolError(f"补丁第 {index + 1} 行缺少成对的文件头，请使用 --- 路径和 +++ 路径")
         old = lines[index][4:].rstrip("\n").split("\t", 1)[0]
         new = lines[index + 1][4:].rstrip("\n").split("\t", 1)[0]
         if old.startswith("a/") and (new.startswith("b/") or new == "/dev/null"):
@@ -159,28 +159,23 @@ def parse_unified_patch(patch: str):
         hunks = []
         while index < len(lines) and lines[index].startswith("@@"):
             head = lines[index].rstrip("\n")
-            header = re.fullmatch(r"@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@.*", head)
-            if header is None and head != "@@":
-                raise ToolError(f"{old} 的补丁片段头无效")
-            offset = before_count = after_count = 0
-            if header:
-                offset, before_count, after_count = (int(part) if part is not None else 1 for part in header.groups())
+            if head != "@@" and "@@" not in head[2:]:
+                raise ToolError(f"{old} 的第 {len(hunks) + 1} 个片段头无效，请使用 @@ 或完整的 @@ ... @@")
+            location = re.match(r"@@\s*-(\d+)(?=[,\s]|$)", head)
+            offset = int(location[1]) if location else None
             index += 1
             before, after = [], []
             while index < len(lines):
                 raw = lines[index]
-                if header:
-                    if len(before) >= before_count and len(after) >= after_count:
-                        break
-                elif (raw.startswith(("@@", *metadata))
-                      or (raw.startswith("--- ") and index + 2 < len(lines)
-                          and lines[index + 1].startswith("+++ ") and lines[index + 2].startswith("@@"))):
+                if (raw.startswith(("@@", *metadata))
+                    or (raw.startswith("--- ") and index + 2 < len(lines)
+                        and lines[index + 1].startswith("+++ ") and lines[index + 2].startswith("@@"))):
                     break
                 if raw == "\n":
                     raw = " \n"
                 sign, line = raw[0], raw[1:]
                 if sign not in {" ", "+", "-"}:
-                    raise ToolError(f"{old} 的补丁片段行数与声明不符")
+                    raise ToolError(f"{old} 的第 {len(hunks) + 1} 个片段缺少正文前缀，请用空格、- 或 +")
                 index += 1
                 if index < len(lines) and lines[index].rstrip("\n") == "\\ No newline at end of file":
                     line = line.removesuffix("\n")
@@ -191,10 +186,10 @@ def parse_unified_patch(patch: str):
                     before.append(line)
                 if sign != "-":
                     after.append(line)
-            if header and (len(before) != before_count or len(after) != after_count or not (before or after)):
-                raise ToolError(f"{old} 的补丁片段行数无效")
-            if not header and not before:
-                raise ToolError(f"{old} 的无行号片段须包含可唯一匹配的原文；纯插入请使用带行号的片段")
+            if not (before or after):
+                raise ToolError(f"{old} 的第 {len(hunks) + 1} 个片段没有正文")
+            if offset is None and not before:
+                raise ToolError(f"{old} 的第 {len(hunks) + 1} 个片段为纯插入，请提供旧文件起始行号")
             hunks.append((offset, before, after))
         if not hunks:
             raise ToolError(f"{old} 没有补丁片段")
@@ -207,9 +202,17 @@ def patch_text(path: str, text: str, hunks) -> str:
     for number, (offset, old, new) in enumerate(hunks, 1):
         if old:
             positions = [i for i, line in enumerate(lines) if line == old[0] and lines[i:i + len(old)] == old]
-            if len(positions) != 1:
-                raise ToolError(f"{path} 的第 {number} 个片段原文必须唯一匹配")
-            position = positions[0]
+            if not positions:
+                raise ToolError(f"{path} 的第 {number} 个片段未找到原文，请重新读取文件后用 edit_file 或补充正确上下文")
+            nearest = positions
+            if offset is not None and len(positions) > 1:
+                hint = max(offset - 1, 0) + shift
+                distance = min(abs(i - hint) for i in positions)
+                nearest = [i for i in positions if abs(i - hint) == distance]
+            if len(nearest) != 1:
+                numbers = ", ".join(str(i + 1) for i in positions)
+                raise ToolError(f"{path} 的第 {number} 个片段匹配多处，起始行：{numbers}，请用 edit_file 或补充更多上下文")
+            position = nearest[0]
         else:
             position = offset + shift
             if not 0 <= position <= len(lines):

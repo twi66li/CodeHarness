@@ -33,6 +33,9 @@ class RealPatchTests(unittest.TestCase):
     def test_record_real_patch_acceptance(self):
         results = list(replay_examples())
         self.assertTrue(results)
+        # 001/002 使用另一种文件头格式，021/025 的原文与目标文件不符。
+        self.assertEqual([(case, error) for case, error in results
+                          if error and case not in {"001", "002", "021", "025"}], [])
         print(f"真实补丁回放 {sum(error is None for _, error in results)}/{len(results)}")
 
 

@@ -84,17 +84,35 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(first.read_text(encoding="utf-8"), "heading\nunchanged\nending\n")
             self.assertEqual(second.read_text(encoding="utf-8"), "new\n")
 
-    def test_unified_patch_rejects_unnumbered_insert_and_wrong_numbered_counts(self):
+    def test_unified_patch_tolerates_wrong_counts_but_requires_position_for_pure_insert(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             path = root / "a.txt"
             path.write_text("old\n", encoding="utf-8")
             registry = Registry(Workspace(root), Policy(allow_write=True))
             register_workspace_tools(registry)
-            for hunk in ("@@\n+new\n", "@@ -1,2 +1 @@\n-old\n+new\n"):
-                with self.subTest(hunk=hunk), self.assertRaises(ToolError):
-                    registry.invoke("apply_patch", {"patch": "--- a.txt\n+++ a.txt\n" + hunk})
-                self.assertEqual(path.read_text(encoding="utf-8"), "old\n")
+            header = "--- a.txt\n+++ a.txt\n"
+            with self.assertRaisesRegex(ToolError, "纯插入"):
+                registry.invoke("apply_patch", {"patch": header + "@@\n+new\n"})
+            for marker in ("@@ -1,20 +1,20 @@", "@@ -1,0 +1,0 @@", "@@ 修改标题 @@"):
+                with self.subTest(marker=marker):
+                    path.write_text("old\n", encoding="utf-8")
+                    registry.invoke("apply_patch", {"patch": header + marker + "\n-old\n+new\n"})
+                    self.assertEqual(path.read_text(encoding="utf-8"), "new\n")
+
+    def test_unified_patch_uses_nearest_line_hint_and_rejects_ties(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "a.txt"
+            original = "old\nkeep\nold\n"
+            path.write_text(original, encoding="utf-8")
+            registry = Registry(Workspace(root), Policy(allow_write=True))
+            register_workspace_tools(registry)
+            with self.assertRaisesRegex(ToolError, "a.txt.*第 1.*1, 3.*edit_file"):
+                registry.invoke("apply_patch", {"patch": "--- a.txt\n+++ a.txt\n@@ -2 +2 @@\n-old\n+new\n"})
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+            registry.invoke("apply_patch", {"patch": "--- a.txt\n+++ a.txt\n@@ -3 +3 @@\n-old\n+new\n"})
+            self.assertEqual(path.read_text(encoding="utf-8"), "old\nkeep\nnew\n")
 
     def test_unified_patch_exclusively_creates_and_rolls_back_without_hard_links(self):
         create = "--- /dev/null\n+++ new.txt\n@@ -0,0 +1 @@\n+created\n"
