@@ -179,12 +179,7 @@ class Agent:
             self.store.append(sid, "message", {"role": "user", "content": task})
         else:
             sid = self.store.create(self.workspace.root, self.model.name, parent_id)
-            system = context.system(readonly)
-            if not readonly and self.enable_delegate and "delegate" not in self.disabled_tools:
-                system += ("\n\n在用户和项目规则允许委派时，若任务有多个可独立调查的改动点，"
-                           "或需要辨别活跃调用与同名历史实现，先调用 delegate 调查其中一个明确的只读问题。"
-                           "要求子任务返回文件路径和调用证据，主任务负责综合、修改和验证。单点小改动直接处理。")
-            self.store.append(sid, "message", {"role": "system", "content": system})
+            self.store.append(sid, "message", {"role": "system", "content": context.system(readonly)})
             self.store.append(sid, "message", {"role": "user", "content": task})
             self._save_snapshot(sid, "baseline", snapshot)
         self.store.status(sid, "running")
