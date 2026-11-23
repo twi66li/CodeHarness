@@ -101,7 +101,7 @@ A model adapter implements `complete(messages, tools, max_tokens, *, timeout=Non
 
 Test subprocesses and independent acceptance use an environment allowlist. `run` and `resume` accept `--pass-env NAME` for explicit process variables and warn for sensitive names. Workspace tools filter common private key and credential filenames.
 Untracked files ignored by Git stay out of file lists, search results and `changed_files`. `search` supports `regex` and `max_results`, and uses ripgrep for regular expressions when available.
-Use `apply_patch` for multi-hunk or multi-file edits. A hunk with existing text can start with a standalone `@@` and use the usual space, `-`, and `+` prefixes. The old text must match exactly once. Pure insertions and new files require standard numbered hunk headers. The tool validates all hunks before replacing files. Use `--disable-tool apply_patch` in `run`, `resume` or `benchmark` to omit it.
+Use `apply_patch` for multi-hunk or multi-file edits. Hunk bodies use the usual space, `-` and `+` prefixes. Line numbers are optional when old text is present, and declared line counts may differ from the body. If the old text matches several locations, a line hint must identify a unique nearest match. Pure insertions and new files require an old-file start position. The tool validates all hunks before replacing files. Use `--disable-tool apply_patch` in `run`, `resume` or `benchmark` to omit it.
 
 Five consecutive tool calls with identical arguments and results end the session with state `stalled` and CLI exit code 2. Use `trace` to view earlier warnings.
 
@@ -169,7 +169,7 @@ Benchmark pairs run on one model. Quota exhaustion preserves the tokens already 
 
 | Item | Result | Notes |
 | --- | --- | --- |
-| Unit and contract tests | 119/121 passed (2 skipped) | Symlink permissions and the opt-in scale test account for the local skips |
+| Unit and contract tests | 127/129 passed (2 skipped) | Symlink permissions and the opt-in scale test account for the local skips |
 | Reference fixture acceptance | 19/19 passed | `full` 12, `multi` 3, `large` 4. Every initial version fails its assertions and every reference fix passes (0 model calls) |
 | `glm-5.3` (`core`, `low`, 4096) | 4/5 (original prompt); `invoice` 1/1 after clarification | 33 requests, 65,570 tokens, 65.82 s, 0 model errors; acceptance exposed a negative-rounding difference under the original prompt |
 | `glm-5.3` (`multi`, `low`, 4096) | 3/3 passed | All three 11-file backend tasks fixed across exactly 3 modules; 22 requests, 62,579 tokens, 53.41 s, 0 model errors; `write_file` misuse errors dropped from 3 to 0 |
@@ -189,6 +189,8 @@ The model made zero delegation calls across the six runs where the tool was avai
 **Magpie follow-up (2026-11-24).** We ran the three `multi` tasks twice on `workbuddy/deepseek-v4.1-flash`. With the revised patch syntax, patch outcomes changed from 0 successes and 6 failures to 4 successes and 1 failure. Both versions passed 6/6 independent checks. On the new version, enabling and disabling patches both passed 6/6, with 59 and 55 requests respectively. These pairs use the same Magpie route.
 
 The original large-repository prompts still produced no spontaneous delegation. When explicitly asked to delegate a single-file investigation, the model invoked `delegate`. The child completed one read-only search in two model requests and returned call-site evidence. The parent passed independent acceptance. This run verifies the live delegation path. Its performance benefit remains unmeasured.
+
+**S15 patch and delegation experiments.** Offline replays of real rejected patches improved from 6/27 to 23/27. With the same Magpie model, `core` passed 5/5 and the six matched `multi` runs passed in both patch configurations, each with a median of 10 requests. The new `investigate-order-ledger` fixture requires fixes in two independent call chains and its reference solution passed. Under a 120,000-token case budget, both delegation pilot runs exhausted their budgets and made zero delegation calls. The full comparison stopped at the pilot gate.
 
 Use `python -m unittest discover -s tests -v` for a full regression. If local loopback connections are forbidden, set `$env:CODEHARNESS_SKIP_LOOPBACK='1'` in PowerShell to explicitly skip the 5 real local HTTP integration tests; simulated transport and CLI tool-chain tests still run. That mode is not a full network regression.
 
