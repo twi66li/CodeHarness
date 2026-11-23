@@ -682,6 +682,13 @@ class RuntimeTests(unittest.TestCase):
         result = self.agent(model).run("实现功能")
         self.assertEqual((result.status, result.verification), ("unverified", "failed"))
 
+    def test_workspace_without_skills_omits_skill_tool_and_system_section(self):
+        model = ScriptModel(DemoModel.text("完成"))
+        self.agent(model).run("检查仓库")
+        request = model.requests[0]
+        self.assertNotIn("load_skill", {tool["function"]["name"] for tool in request["tools"]})
+        self.assertNotIn("Skills", request["messages"][0]["content"])
+
     def test_skill_body_is_loaded_only_when_requested(self):
         directory = self.root / ".codeharness" / "skills" / "verify"
         directory.mkdir(parents=True)
@@ -690,6 +697,7 @@ class RuntimeTests(unittest.TestCase):
         systems = []
 
         def first(messages, tools):
+            self.assertIn("load_skill", {tool["function"]["name"] for tool in tools})
             self.assertNotIn("UNIQUE_SKILL_BODY", messages[0]["content"])
             self.assertIn("验证方法", messages[0]["content"])
             systems.append(messages[0])

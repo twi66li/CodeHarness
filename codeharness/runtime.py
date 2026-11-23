@@ -86,10 +86,14 @@ class Agent:
         if readonly:
             registry.tools = {name: tool for name, tool in registry.tools.items() if tool.effect == "read"}
 
-        def load_skill(name):
-            result = context.load_skill(name)
-            self.store.append(sid, "skill_loaded", {**result, "delivery": "message"})
-            return {"name": result["name"], "loaded": True, "chars": len(result["instructions"])}
+        if context.skills:
+            def load_skill(name):
+                result = context.load_skill(name)
+                self.store.append(sid, "skill_loaded", {**result, "delivery": "message"})
+                return {"name": result["name"], "loaded": True, "chars": len(result["instructions"])}
+
+            registry.register(Tool("load_skill", "按名称加载已列出的 Skill 工作方法。", parameters({
+                "name": string("Skill 目录名")}, ["name"]), load_skill))
 
         def read_artifact(artifact_id, offset=0, chars=4000):
             if offset < 0 or not 1 <= chars <= 6000:
@@ -98,8 +102,6 @@ class Agent:
             return {"artifact_id": artifact_id, "offset": offset,
                     "content": text[offset:offset + chars], "total_chars": len(text)}
 
-        registry.register(Tool("load_skill", "按名称加载已列出的 Skill 工作方法。", parameters({
-            "name": string("Skill 目录名")}, ["name"]), load_skill))
         registry.register(Tool("read_artifact", "分页读取本任务已保存的完整工具输出。", parameters({
             "artifact_id": string("工具结果中的产物 ID"), "offset": integer("字符偏移，默认 0"),
             "chars": integer("读取字符数，默认 4000，上限 6000")}, ["artifact_id"]), read_artifact))
