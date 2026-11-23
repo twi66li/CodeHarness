@@ -41,6 +41,32 @@ class PatchModel:
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_investigation_fixture_requires_both_independent_repairs(self):
+        from codeharness.benchmark import materialize
+        from codeharness.benchmark_large import investigation_tasks
+
+        task, = investigation_tasks()
+        copy, = investigation_tasks()
+        def fingerprint(item):
+            return sha256(json.dumps(item.files, sort_keys=True).encode()).hexdigest()
+
+        self.assertEqual(fingerprint(task), fingerprint(copy))
+        self.assertEqual(set(task.reference), {"orders/pipeline.py", "accounting/reconcile.py"})
+        self.assertNotIn("委派", task.prompt)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            verifier = root / "acceptance.py"
+            verifier.write_text("import sys\nsys.path.insert(0, sys.argv[1])\n" + task.acceptance, encoding="utf-8")
+            for file, content in task.reference.items():
+                workspace = root / Path(file).stem
+                materialize(workspace, {**task.files, file: content})
+                result = acceptance(workspace, verifier)
+                self.assertFalse(result["passed"])
+                self.assertIn("AssertionError", result["output"])
+            output = root / "bench"
+            with redirect_stdout(StringIO()):
+                self.assertEqual(main(["--mode", "fixtures", "--task", task.id, "--output", str(output)]), 0)
+
     def test_large_tasks_have_deterministic_size_and_long_changed_modules(self):
         from codeharness.benchmark import materialize
         from codeharness.benchmark_large import HISTORICAL_CASES, large_tasks

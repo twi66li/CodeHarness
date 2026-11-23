@@ -16,7 +16,7 @@ from urllib.parse import quote
 import uuid
 
 from .benchmark_tasks import ALL_TASKS, MULTI_TASKS, TASKS, Task
-from .benchmark_large import LARGE_TASK_IDS, large_tasks
+from .benchmark_large import INVESTIGATION_TASK_IDS, LARGE_TASK_IDS, investigation_tasks, large_tasks
 from .cli import load_env, model_connection
 from .model_pool import ModelPool
 from .models import ChatModel, Model
@@ -380,7 +380,8 @@ def main(argv: list[str] | None = None) -> int:
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--suite", choices=("core", "full", "multi", "large"), default="core",
                            help="core=5 个基础任务；full=12 个基础任务；multi=3 个多模块任务；large=4 个大仓库任务")
-    selection.add_argument("--task", action="append", choices=tuple(task.id for task in ALL_TASKS) + LARGE_TASK_IDS,
+    selection.add_argument("--task", action="append",
+                           choices=tuple(task.id for task in ALL_TASKS) + LARGE_TASK_IDS + INVESTIGATION_TASK_IDS,
                            help="仅运行指定任务，可重复指定多个任务")
     parser.add_argument("--variants", choices=("delegate", "no-delegate", "both"), default="delegate")
     parser.add_argument("--repeats", type=int, default=1, help="真实模型评测的重复轮数")
@@ -426,6 +427,8 @@ def main(argv: list[str] | None = None) -> int:
         suite_map = {"core": TASKS[:5], "full": TASKS, "multi": MULTI_TASKS}
         if args.task:
             candidates = ALL_TASKS + (large_tasks() if set(args.task).intersection(LARGE_TASK_IDS) else ())
+            if set(args.task).intersection(INVESTIGATION_TASK_IDS):
+                candidates += investigation_tasks()
             by_id = {task.id: task for task in candidates}
             tasks = tuple(by_id[name] for name in dict.fromkeys(args.task))
         else:

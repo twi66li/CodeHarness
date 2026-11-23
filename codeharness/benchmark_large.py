@@ -9,6 +9,7 @@ from .benchmark_tasks import MULTI_TASKS, TASKS, Task
 
 BASE_TASKS = (*MULTI_TASKS, next(task for task in TASKS if task.id == "invoice"))
 LARGE_TASK_IDS = tuple(f"large-{task.id}" for task in BASE_TASKS)
+INVESTIGATION_TASK_IDS = ("investigate-order-ledger",)
 HISTORICAL_CASES = {
     "order-pipeline": ("app/coupons.py", "profile.discount_cents(100, None), 0"),
     "rbac-gateway": ("app/policies.py", "profile.evaluate(set(), [], 'orders', 'read'), False"),
@@ -107,3 +108,29 @@ def large_tasks(seed: int = 20261123) -> tuple[Task, ...]:
             prompt = f"修复以下业务规则，并运行测试确认现有行为保持正常：{task.prompt.split('：', 1)[1]}"
         result.append(Task(LARGE_TASK_IDS[index], prompt, files, reference, task.acceptance))
     return tuple(result)
+
+
+def investigation_tasks() -> tuple[Task, ...]:
+    orders, _, ledger, _ = large_tasks()
+    files, reference, checks = {}, {}, []
+    for package, task, broken in (("orders", orders, "app/pipeline.py"),
+                                  ("accounting", ledger, "app/reconcile.py")):
+        def source(text):
+            return (text.replace("from app.", f"from {package}.")
+                        .replace("from app import ", f"from {package} import ")
+                        .replace("from historical import ", f"from {package}_history import "))
+
+        def located(path):
+            area, name = path.split("/", 1)
+            return {"app": f"{package}/{name}", "historical": f"{package}_history/{name}",
+                    "tests": f"tests/test_{package}_{name.removeprefix('test_')}"}[area]
+
+        # Each subsystem retains one active defect. The historical implementations remain available.
+        baseline = {**task.files, **{path: text for path, text in task.reference.items() if path != broken}}
+        files.update({located(path): source(text) for path, text in baseline.items()})
+        reference[located(broken)] = source(task.reference[broken])
+        checks.append(source(task.acceptance))
+    prompt = ("修复两个独立业务问题，并运行现有测试。库存不足时订单必须被拒绝，"
+              "不得确认订单或留下 confirmed 审计事件；库存充足的订单流程继续有效。"
+              "财务对账须同时报告账本缺失、外部记录缺失和金额不符，按 ref 升序排列。")
+    return (Task(INVESTIGATION_TASK_IDS[0], prompt, files, reference, "\n".join(checks)),)

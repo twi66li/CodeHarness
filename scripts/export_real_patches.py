@@ -10,7 +10,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 
 from codeharness.benchmark import materialize
-from codeharness.benchmark_large import large_tasks
+from codeharness.benchmark_large import investigation_tasks, large_tasks
 from codeharness.benchmark_tasks import ALL_TASKS
 from codeharness.cli import load_env
 from codeharness.tools import Policy, Registry, ToolError, Workspace, register_workspace_tools
@@ -114,7 +114,7 @@ def failures(database, session, task):
 
 
 def export(benchmarks, output):
-    tasks = {task.id: task for task in (*ALL_TASKS, *large_tasks())}
+    tasks = {task.id: task for task in (*ALL_TASKS, *large_tasks(), *investigation_tasks())}
     private = private_checker()
     output.mkdir(parents=True, exist_ok=False)
     count = restored = 0
