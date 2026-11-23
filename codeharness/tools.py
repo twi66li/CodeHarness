@@ -656,8 +656,8 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None):
             ["path", "old_text", "new_text", "expected_sha256"]), edit_file, "write"),
         Tool("write_file", "仅用于创建尚不存在的新文件；修改已有文件必须使用 edit_file。", parameters({
             "path": string("相对文件路径"), "content": string("文件内容")}, ["path", "content"]), write_file, "write"),
-        Tool("apply_patch", "一次修改多处。先读取原文，每个片段必须唯一匹配；失败时可改用 edit_file。",
-             parameters({"patch": string("每个文件用 --- 路径、+++ 路径。已有原文的修改优先使用独立的 @@ 行，"
+        Tool("apply_patch", "可一次修改多处或多个文件。先读取原文；不熟悉 diff 格式时可用 edit_file。",
+             parameters({"patch": string("每个文件用 --- 路径、+++ 路径。已有原文的片段可以省略行号，使用独立的 @@ 行，"
                                            "然后写带前缀的正文：空格为上下文，- 删除，+ 新增。"
                                            "例如 --- a.py\n+++ a.py\n@@\n-old = 1\n+old = 2\n。"
                                            "纯插入或新建使用带起点和行数的标准统一 diff。")}, ["patch"]), apply_patch, "write"),
