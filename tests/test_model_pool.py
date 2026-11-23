@@ -32,6 +32,40 @@ def reply():
 
 
 class ModelPoolTests(unittest.TestCase):
+    def test_namespaced_model_in_ledger_and_benchmark_directories(self):
+        name = "workbuddy/deepseek-v4.1-flash:stable"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = root / "pool.json"
+            config.write_text(json.dumps(settings((name,))), encoding="utf-8")
+            self.assertEqual(model_pool.ModelPool(config).status()[0]["model"], name)
+            for repeats in (1, 2):
+                output = root / f"bench-{repeats}"
+                with patch("os.environ", ENV), patch("codeharness.models.urlopen", side_effect=lambda *a, **kw: reply()), \
+                        redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    self.assertEqual(benchmark([
+                        "--mode", "model", "--task", "discount", "--allow-exec", "--model-pool", str(config),
+                        "--repeats", str(repeats), "--max-requests", "1", "--max-tokens", "10000",
+                        "--total-requests", str(repeats), "--total-tokens", str(10000 * repeats),
+                        "--output", str(output),
+                    ]), 2)
+                report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+                for row in report["cases"]:
+                    self.assertEqual(row["model"], name)
+                    workspace = Path(row["workspace"])
+                    self.assertEqual(len(workspace.parts), 4)
+                    self.assertNotIn(":", workspace.parts[-2])
+                    self.assertTrue((output / workspace).is_dir())
+            self.assertGreater(model_pool.ModelPool(config).status()[0]["used_tokens"], 0)
+
+    def test_rejects_model_names_with_path_traversal_or_whitespace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "pool.json"
+            for name in ("workbuddy/../flash", "/flash", "workbuddy/flash\n", "a b"):
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "模型名称不合法"):
+                    config.write_text(json.dumps(settings((name,))), encoding="utf-8")
+                    model_pool.ModelPool(config)
+
     def test_run_switch_counts_each_actual_model_request(self):
         sent = []
 

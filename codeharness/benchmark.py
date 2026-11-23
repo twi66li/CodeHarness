@@ -12,6 +12,7 @@ from statistics import mean, median, stdev
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 import uuid
 
 from .benchmark_tasks import ALL_TASKS, MULTI_TASKS, TASKS, Task
@@ -315,10 +316,12 @@ def run_suite(tasks: tuple[Task, ...], output: Path, *, model: Model | None = No
                     row = {"task": task.id, "variant": variant, "skipped": skipped}
                 else:
                     directory = output / task.id / variant
+                    # A provider namespace belongs in one path component, not a subdirectory.
+                    component = quote(chosen, safe="") if chosen else None
                     if repeats > 1:
-                        directory /= f"r{repeat}-{chosen}" if chosen else f"r{repeat}"
-                    elif chosen:
-                        directory /= chosen
+                        directory /= f"r{repeat}-{component}" if component else f"r{repeat}"
+                    elif component:
+                        directory /= component
                     row = run_case(task, variant, output, directory, model, limits, disabled_tools)
                     access_denied = row.get("model_access_denied", False)
                     usage = row.get("usage", {})

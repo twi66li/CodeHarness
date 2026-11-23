@@ -35,7 +35,7 @@ class ModelPool:
             self.quotas = {}
             for entry in settings["models"]:
                 name = entry["name"]
-                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) or name in self.quotas:
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*", name) or ".." in name or name in self.quotas:
                     raise ValueError("模型名称不合法或重复")
                 tokens = min(entry["quota_tokens"], entry.get("cap_tokens", entry["quota_tokens"]))
                 if type(tokens) is not int or tokens < 0:
