@@ -522,6 +522,25 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(model.requests), 3)
         self.assertEqual(result.usage["requests"], 3)
 
+    def test_delegation_guidance_matches_tool_availability(self):
+        for options, readonly, available in (
+            ({}, False, True),
+            ({"enable_delegate": False}, False, False),
+            ({"disabled_tools": ("delegate",)}, False, False),
+            ({}, True, False),
+        ):
+            with self.subTest(options=options, readonly=readonly):
+                model = ScriptModel(DemoModel.text("完成"))
+                self.agent(model, **options).run("检查仓库", readonly=readonly)
+                request = model.requests[0]
+                names = {tool["function"]["name"] for tool in request["tools"]}
+                self.assertEqual("delegate" in names, available)
+                system = request["messages"][0]["content"]
+                if available:
+                    self.assertIn("先调用 delegate 调查其中一个", system)
+                else:
+                    self.assertEqual(system, Context(self.root).system(readonly))
+
     def test_child_has_no_write_execute_or_recursive_delegate_tools(self):
         def inspect(messages, tools):
             names = {tool["function"]["name"] for tool in tools}
