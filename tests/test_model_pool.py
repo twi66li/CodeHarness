@@ -8,9 +8,10 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from codeharness.benchmark import main as benchmark
+from codeharness.benchmark import diagnostics, main as benchmark
 from codeharness.cli import main as cli
 from codeharness import model_pool
+from codeharness.store import Store
 
 
 def settings(names=("first", "second")):
@@ -161,3 +162,32 @@ class ModelPoolTests(unittest.TestCase):
                 call.assert_not_called()
             report = json.loads((output / "report.json").read_text(encoding="utf-8"))
         self.assertEqual([row["skipped"] for row in report["cases"]], ["quota_exhausted"] * 2)
+
+    def test_run_records_local_quota_error_without_physical_request(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "repo"
+            workspace.mkdir()
+            config = root / "pool.json"
+            data = settings(("first",))
+            data["models"][0]["quota_tokens"] = 1
+            config.write_text(json.dumps(data), encoding="utf-8")
+            store_path = root / "state.sqlite3"
+            with patch("os.environ", ENV), patch("codeharness.models.urlopen") as call, redirect_stdout(StringIO()) as output:
+                code = cli(["run", "检查工作区", "--workspace", str(workspace), "--store", str(store_path),
+                            "--model-pool", str(config), "--json"])
+            call.assert_not_called()
+            result = json.loads(output.getvalue())
+            self.assertEqual((code, result["status"], result["usage"]["requests"]), (2, "error", 0))
+            store = Store(store_path)
+            try:
+                errors = [event["data"] for event in store.events(result["session_id"])
+                          if event["kind"] == "model_error"]
+                evidence = diagnostics(store)
+            finally:
+                store.close()
+            self.assertEqual(len(errors), 1)
+            self.assertTrue(errors[0]["preflight"])
+            self.assertTrue(errors[0]["quota_exhausted"])
+            self.assertEqual(evidence["model_errors"], 1)
+            self.assertTrue(evidence["quota_exhausted"])

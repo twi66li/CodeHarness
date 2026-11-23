@@ -161,9 +161,14 @@ def parse_unified_patch(patch: str):
             index += 1
             before, after = [], []
             while len(before) < before_count or len(after) < after_count:
-                if index == len(lines) or lines[index][:1] not in {" ", "+", "-"}:
+                if index == len(lines):
                     raise ToolError(f"{old} 的补丁片段行数与声明不符")
-                sign, line = lines[index][0], lines[index][1:]
+                raw = lines[index]
+                if raw == "\n":
+                    raw = " \n"
+                sign, line = raw[0], raw[1:]
+                if sign not in {" ", "+", "-"}:
+                    raise ToolError(f"{old} 的补丁片段行数与声明不符")
                 index += 1
                 if index < len(lines) and lines[index].rstrip("\n") == "\\ No newline at end of file":
                     line = line.removesuffix("\n")
@@ -227,7 +232,16 @@ def replace_patch_files(updates):
             if after is None:
                 path.unlink()
             elif before is None:
-                os.link(after, path)
+                try:
+                    os.link(after, path)
+                except FileExistsError:
+                    raise
+                except OSError:
+                    with path.open("xb") as stream:
+                        applied.append((path, backup))
+                        stream.write(after.read_bytes())
+                    path.chmod(after.stat().st_mode & 0o777)
+                    continue
             else:
                 os.replace(after, path)
             applied.append((path, backup))

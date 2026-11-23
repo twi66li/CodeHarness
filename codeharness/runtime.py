@@ -228,7 +228,8 @@ class Agent:
                 state.truncations += 1
             elif event["kind"] == "tool_stall_warning":
                 state.stall_warnings.add((data["kind"], data["key"]))
-            elif legacy_ids and event["kind"] == "message":
+            elif event["kind"] == "message" and data.get("role") == "assistant":
+                state.truncations = 0
                 for call in data.get("tool_calls", []):
                     if call["id"] not in legacy_ids:
                         continue
@@ -277,7 +278,8 @@ class Agent:
 
     def _next_request(self, state: LoopState, registry: Registry, context: Context) -> Reply | None:
         sid = state.sid
-        output_cap = self.limits.output_tokens
+        retry_output_cap = min(2 * self.limits.output_tokens, 8192)
+        output_cap = retry_output_cap if state.truncations == 1 else self.limits.output_tokens
         while True:
             if self._model_access_error:
                 state.status, state.answer = "error", self._model_access_error
@@ -307,7 +309,13 @@ class Agent:
             prepare_attempt = getattr(self.model, "prepare_attempt", None)
             if prepare_attempt is not None:
                 previous_model = self.model.name
-                prepare_attempt(estimated_input, output_tokens)
+                try:
+                    prepare_attempt(estimated_input, output_tokens)
+                except ModelError as exc:
+                    self.store.append(sid, "model_error", {"attempt": 0, "error": str(exc),
+                        "retryable": exc.retryable, "access_denied": exc.access_denied,
+                        "quota_exhausted": exc.quota_exhausted, "preflight": True})
+                    raise
                 if self.model.name != previous_model:
                     self.observe("model_switch", {"previous": previous_model, "model": self.model.name})
             seconds_left = state.deadline - time.monotonic()
@@ -328,12 +336,13 @@ class Agent:
                     if not self._recover_truncation(state, exc, estimated_input, output_tokens):
                         return None
                     if state.truncations == 1:
-                        output_cap = min(2 * self.limits.output_tokens, 8192)
+                        output_cap = retry_output_cap
                     continue
                 if not self._retry(state, exc, estimated_input, output_tokens, min_output):
                     return None
                 continue
             state.failed_attempts = 0
+            state.truncations = 0
             if not reply.estimated:
                 state.calibrator.observe(raw_estimate, reply.input_tokens)
             self.store.append(sid, "usage", {"input_tokens": reply.input_tokens,
@@ -363,7 +372,7 @@ class Agent:
         if exc.access_denied:
             self._model_access_error = str(exc)
         self.store.append(sid, "model_error", {"attempt": state.failed_attempts, "error": str(exc),
-            "retryable": exc.retryable, "access_denied": exc.access_denied})
+            "retryable": exc.retryable, "access_denied": exc.access_denied, "quota_exhausted": exc.quota_exhausted})
         # Reserve output only when a provider may have generated tokens.
         input_use, output_use = (estimated_input, output_tokens) if exc.consume_output_budget else (0, 0)
         self.store.append(sid, "usage", {"input_tokens": input_use, "output_tokens": output_use,

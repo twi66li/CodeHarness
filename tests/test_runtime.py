@@ -316,6 +316,32 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((result.usage["requests"], result.usage["input_tokens"], result.usage["output_tokens"]),
                          (3, 30, 15))
 
+    def test_successful_replies_reset_truncation_streak(self):
+        def truncate(messages, tools):
+            raise ModelError("truncated reply", truncated=True, usage=(10, 5))
+
+        read = DemoModel.call("list_files", {})
+        model = ScriptModel(truncate, read, truncate, read, truncate, DemoModel.text("完成"))
+        result = self.agent(model).run("检查仓库")
+        self.assertEqual((result.status, result.usage["requests"]), ("completed", 6))
+        self.assertEqual([r["max_tokens"] for r in model.requests], [2048, 4096] * 3)
+
+    def test_resume_restores_only_trailing_truncation_streak(self):
+        sid = self.store.create(self.root, "script-test")
+        self.store.append(sid, "baseline", {"files": {}})
+        self.store.append(sid, "message", {"role": "system", "content": "project rules"})
+        self.store.append(sid, "model_truncated", {"attempt": 1, "max_tokens": 2048})
+        self.store.append(sid, "message", {"role": "assistant", "content": "部分完成"})
+        self.store.append(sid, "model_truncated", {"attempt": 2, "max_tokens": 2048})
+
+        def truncate(messages, tools):
+            raise ModelError("truncated reply", truncated=True, usage=(10, 5))
+
+        model = ScriptModel(truncate, DemoModel.text("完成"))
+        result = self.agent(model).run("继续", session_id=sid)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual([r["max_tokens"] for r in model.requests], [4096, 2048])
+
     def test_legacy_events_can_be_listed_traced_and_resumed_through_truncation(self):
         sid = self.store.create(self.root, "legacy-model")
         self.store.append(sid, "baseline", {"files": {}})

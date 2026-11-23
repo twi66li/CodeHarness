@@ -1,3 +1,4 @@
+import ast
 from contextlib import redirect_stdout
 from hashlib import sha256
 from io import StringIO
@@ -41,7 +42,8 @@ class PatchModel:
 
 class BenchmarkTests(unittest.TestCase):
     def test_large_tasks_have_deterministic_size_and_long_changed_modules(self):
-        from codeharness.benchmark_large import large_tasks
+        from codeharness.benchmark import materialize
+        from codeharness.benchmark_large import HISTORICAL_CASES, large_tasks
 
         def fingerprint(task):
             return sha256(json.dumps(task.files, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
@@ -56,7 +58,24 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertTrue(300_000 <= size <= 600_000)
                 changed = [name for name in task.reference if task.files.get(name) != task.reference[name]]
                 self.assertTrue(2 <= len(changed) <= 4)
-                self.assertGreaterEqual(sum(800 <= len(task.files[name].splitlines()) <= 1500 for name in changed), 2)
+                long_modules = [task.files[name].splitlines() for name in changed
+                                if 800 <= len(task.files[name].splitlines()) <= 1500]
+                self.assertGreaterEqual(len(long_modules), 2)
+                for lines in long_modules:
+                    self.assertLess(sum(line.lstrip().startswith("#") for line in lines) / len(lines), 0.2)
+
+                historical_path, call = HISTORICAL_CASES[task.id.removeprefix("large-")][:2]
+                function = call.removeprefix("profile.").split("(", 1)[0]
+                stem = Path(historical_path).stem
+                self.assertTrue(any(
+                    any(isinstance(node, ast.FunctionDef) and node.name == function for node in ast.parse(source).body)
+                    for name, source in task.files.items() if name.startswith(f"historical/{stem}_")
+                ))
+                with tempfile.TemporaryDirectory() as temp:
+                    materialize(Path(temp), task.files)
+                    run = subprocess.run([sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests",
+                                          "-p", "test_batch_profiles.py"], cwd=temp, capture_output=True, timeout=10)
+                    self.assertEqual(run.returncode, 0, run.stderr.decode("utf-8", errors="replace"))
 
     def test_repeat_statistics_uses_only_complete_pairs(self):
         from codeharness.benchmark import repeat_statistics
@@ -78,6 +97,31 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(stats["variants"]["delegate"]["requests"], {"median": 1, "p90": 2})
         self.assertEqual(repeat_statistics([cases[-1]], 2)["paired"]["tasks"], 0)
         self.assertIsNone(repeat_statistics([cases[0]], 1)["variants"]["delegate"]["pass_at_1"]["stdev"])
+
+    def test_compare_pairs_only_same_model_task_and_round(self):
+        def row(task, model, repeat, success, requests, tokens):
+            return {"task": task, "model": model, "repeat": repeat, "success": success, "variant": "no-delegate",
+                    "usage": {"requests": requests, "input_tokens": tokens, "output_tokens": 2}}
+
+        baseline = {"cases": [row("paired", "first", 1, False, 6, 100),
+                              row("missing", "first", 1, True, 2, 20),
+                              row("model", "first", 1, True, 2, 20),
+                              row("round", "first", 1, True, 2, 20),
+                              {**row("paired", "first", 1, True, 3, 30), "variant": "delegate"}]}
+        treatment = {"cases": [row("paired", "first", 1, True, 4, 70),
+                               row("model", "second", 1, False, 5, 50),
+                               row("round", "first", 2, False, 5, 50),
+                               {**row("missing", "first", 1, False, 5, 50), "skipped": "total_budget"}]}
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(StringIO()) as output:
+            before, after = Path(temp) / "before.json", Path(temp) / "after.json"
+            before.write_text(json.dumps(baseline), encoding="utf-8")
+            after.write_text(json.dumps(treatment), encoding="utf-8")
+            self.assertEqual(main(["compare", "--baseline", str(before), "--treatment", str(after),
+                                   "--baseline-variant", "no-delegate"]), 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result, {"baseline_unpaired": 3, "treatment_unpaired": 2, "by_model": {
+            "first": {"tasks": 1, "pairs": 1, "success_rate_delta": 1, "bootstrap_95ci": [1, 1],
+                      "request_delta_median": -2, "token_delta_median": -30}}})
 
     def test_model_repeats_use_independent_directories_and_record_round_numbers(self):
         with tempfile.TemporaryDirectory() as temp:

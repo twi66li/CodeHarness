@@ -100,11 +100,12 @@ Git 工作区中的未跟踪忽略文件不参与列表、搜索或 `changed_fil
 ```powershell
 python -m codeharness.benchmark --mode fixtures --suite full
 python -m codeharness.benchmark --mode fixtures --suite multi
+python -m codeharness.benchmark --mode fixtures --suite large
 ```
 
 首批 5 个（`core`）覆盖购物车折扣、分页、库存、配置合并及 Decimal 发票；`full` 在此基础上增加日期报表、CSV 导入、订单去重、退避计算、商品搜索、运费及指标统计；`multi` 提供 3 个 11 文件多模块后端样例（订单结算管线、多租户 RBAC 网关、财务幂等对账），均需跨 3 个模块联动修复。它们是可复现的业务夹具，不是从真实开源项目采集的 issue。
 
-评测程序在每个全新工作区运行相同的独立验收；验收脚本不在该工作区内。初始版本必须因需求断言失败，然后由参考实现或真实 Agent 独立验证。报告包含运行状态、独立 success、请求次数、Token、耗时和预算跳过项，保存为 `.codeharness/benchmarks/<id>/report.json`。数据库与样例工作区留在报告目录供追溯。
+`large` 提供 4 个固定种子生成的大仓库任务，各有两份长业务模块及包含同名函数的历史实现。评测程序在全新工作区运行相同的独立验收脚本，脚本位于工作区之外。初始版本必须因需求断言失败，然后由参考实现或真实 Agent 独立验证。报告包含 `success`、请求次数、Token、耗时及预算跳过项，保存为 `.codeharness/benchmarks/<id>/report.json`。数据库与样例工作区留在报告目录供追溯。
 
 ### 真实模型与消融实验
 
@@ -132,6 +133,14 @@ python -m codeharness.benchmark --mode model --suite core --variants both --env-
 
 模型接口支持时，可在 `run`、`resume` 或 `benchmark` 中用 `--reasoning-effort low` 调低推理强度。评测报告会记录显式设置的值。`glm-5.3` 的可选值见 [百炼 GLM 文档](https://help.aliyun.com/zh/model-studio/glm)。
 
+`--repeats N` 为每个任务和变体重复运行 N 轮，总预算应覆盖这些轮次。`--context-chars` 指定触发上下文压缩的字符阈值。`cache_hit_ratio` 是供应商报告的缓存命中 Token 数除以输入 Token 数。输入用量为零时结果为 `null`。
+
+```powershell
+python -m codeharness.benchmark compare --baseline baseline/report.json --treatment treatment/report.json
+```
+
+比较按同一模型、任务和轮次配对，按模型给出成功率差、bootstrap 95% 置信区间，以及请求数和 Token 差值的中位数。报告含多个委派变体时，用 `--baseline-variant` 或 `--treatment-variant` 指定所选变体。
+
 基准验收仍在本机执行模型编写的 Python 代码，独立验收目录不是防篡改安全沙箱。仅用于可信评测任务。
 
 ### 模型额度池
@@ -149,7 +158,7 @@ python -m codeharness.benchmark --mode model --task discount --model-pool .codeh
 | 评测项 | 结果 | 关键统计与说明 |
 | --- | --- | --- |
 | 单元测试与契约回归 | 77/78 通过（1 跳过） | 含 16 项本地 HTTP/CLI 契约测试与 4 阶段进程崩溃注入；符号链接测试因本机权限跳过 |
-| 参考夹具独立验收 | 15/15 通过 | `full` 12 题 + `multi` 3 题初始断言均失败、参考修复均通过独立验收（0 次模型调用） |
+| 参考夹具独立验收 | 19/19 通过 | `full` 12 题、`multi` 3 题、`large` 4 题的初始断言均失败，参考修复均通过独立验收（0 次模型调用） |
 | `glm-5.3`（`core`，`low`，4096） | 4/5（原题面）；`invoice` 澄清后复测 1/1 | 33 次请求、65,570 Token、65.82 秒、0 模型错误；原题面独立验收暴露负数舍入边界差异 |
 | `glm-5.3`（`multi`，`low`，4096） | 3/3 全部通过 | 3 个 11 文件后端任务均精准跨 3 模块修复；22 次请求、62,579 Token、53.41 秒、0 模型错误、`write_file` 误用错误由 3 次降至 0 次 |
 | 委派子任务边界观察 | `delegate_calls = 0` | 上述样例上下文未超阈值，模型直接并行读取效率更高；实际委派收益仍需在更大仓库上另行验证 |
@@ -158,7 +167,7 @@ python -m codeharness.benchmark --mode model --task discount --model-pool .codeh
 
 正常环境使用 `python -m unittest discover -s tests -v` 完整回归。如果明确禁止本地回环连接，可以在 PowerShell 设置 `$env:CODEHARNESS_SKIP_LOOPBACK='1'`，显式跳过 5 项真实本地 HTTP 集成测试；模拟传输与 CLI 工具链测试仍然运行。该模式不等同于完整网络回归。
 
-`python -B scripts/regress.py --tag <标签>` 一次运行单元测试、`full` 与 `multi` 参考夹具及启用、禁用委派的离线 demo，结果与日志写入 `.codeharness/regress/`；`--compare <summary.json>` 与之前的结果对比，`--skip-loopback` 等同于上面的环境变量。CI 在 Ubuntu 与 Windows、Python 3.11～3.13 上运行同一脚本，不调用真实模型。
+`python -B scripts/regress.py --tag <标签>` 运行单元测试、`full`、`multi`、`large` 参考夹具及启用、禁用委派的离线 demo。结果与日志写入 `.codeharness/regress/`。`--compare <summary.json>` 与之前的结果对比，`--skip-loopback` 等同于上面的环境变量。CI 在 Ubuntu 与 Windows、Python 3.11～3.13 上运行同一脚本。
 
 ## 设计取舍
 

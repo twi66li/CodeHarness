@@ -102,11 +102,12 @@ Run the 12 basic multi-file cases (`full`) or the 3 eleven-file multi-module bac
 ```powershell
 python -m codeharness.benchmark --mode fixtures --suite full
 python -m codeharness.benchmark --mode fixtures --suite multi
+python -m codeharness.benchmark --mode fixtures --suite large
 ```
 
 The first 5 (`core`) cover cart discounts, pagination, inventory, config merging and Decimal invoices; `full` adds date reports, CSV import, order de-duplication, backoff calculation, product search, shipping and metrics. `multi` provides 3 eleven-file backend cases (order pipeline, multi-tenant RBAC gateway, idempotent ledger reconciliation), each requiring a coordinated fix across 3 modules. These are reproducible business fixtures, not issues collected from real open-source projects.
 
-Every case runs the same independent acceptance in a fresh workspace; the acceptance script is not inside that workspace. The initial version must fail on a requirement assertion, then the reference fix or a real agent is verified independently. Reports include run status, independent `success`, request count, tokens, duration and budget skips, saved as `.codeharness/benchmarks/<id>/report.json`. Databases and case workspaces stay in the report directory for traceability.
+`large` generates four reproducible repository tasks from a fixed seed. Each has two long business modules and historical implementations with matching function names. Each case runs the same independent acceptance script outside a fresh agent workspace. The initial version must fail a requirement assertion before the reference fix or real agent is verified. Reports include `success`, request count, tokens, duration and budget skips at `.codeharness/benchmarks/<id>/report.json`. Databases and case workspaces stay in the report directory for traceability.
 
 ### Real models and ablation
 
@@ -134,6 +135,14 @@ A pair is recorded as `skipped` when the total budget cannot start it. Actual pr
 
 Where the endpoint supports it, `--reasoning-effort low` lowers reasoning effort in `run`, `resume` or `benchmark`; reports record an explicitly set value. See the [Model Studio GLM docs](https://help.aliyun.com/zh/model-studio/glm) for `glm-5.3` values.
 
+`--repeats N` runs each task and variant N times. Set a total budget covering all rounds. `--context-chars` sets the character threshold for context compaction. `cache_hit_ratio` divides provider-reported cached tokens by input tokens and is `null` when input usage is zero.
+
+```powershell
+python -m codeharness.benchmark compare --baseline baseline/report.json --treatment treatment/report.json
+```
+
+The comparison pairs runs by model, task and round. For each model it reports the success rate difference, a bootstrap 95% confidence interval, and median request and token differences. Use `--baseline-variant` or `--treatment-variant` to select a delegation variant when a report contains both.
+
 Benchmark acceptance still executes model-written Python code locally; the independent acceptance directory is not a tamper-proof sandbox. Use only for trusted evaluation tasks.
 
 ### Model quota pool
@@ -151,7 +160,7 @@ Benchmark pairs run on one model. Quota exhaustion preserves the tokens already 
 | Item | Result | Notes |
 | --- | --- | --- |
 | Unit and contract tests | 77/78 passed (1 skipped) | Includes 16 local HTTP/CLI contract tests and 4-stage process crash injection; the symlink test is skipped for lack of local permission |
-| Reference fixture acceptance | 15/15 passed | `full` 12 + `multi` 3: every initial version fails its assertions and every reference fix passes (0 model calls) |
+| Reference fixture acceptance | 19/19 passed | `full` 12, `multi` 3, `large` 4. Every initial version fails its assertions and every reference fix passes (0 model calls) |
 | `glm-5.3` (`core`, `low`, 4096) | 4/5 (original prompt); `invoice` 1/1 after clarification | 33 requests, 65,570 tokens, 65.82 s, 0 model errors; acceptance exposed a negative-rounding difference under the original prompt |
 | `glm-5.3` (`multi`, `low`, 4096) | 3/3 passed | All three 11-file backend tasks fixed across exactly 3 modules; 22 requests, 62,579 tokens, 53.41 s, 0 model errors; `write_file` misuse errors dropped from 3 to 0 |
 | Delegation observation | `delegate_calls = 0` | Context stayed below the threshold in these cases and the model read files directly; delegation benefit still needs measuring on larger repositories |
@@ -160,7 +169,7 @@ Each case was run once (n = 1), so differences between configurations are not st
 
 Use `python -m unittest discover -s tests -v` for a full regression. If local loopback connections are forbidden, set `$env:CODEHARNESS_SKIP_LOOPBACK='1'` in PowerShell to explicitly skip the 5 real local HTTP integration tests; simulated transport and CLI tool-chain tests still run. That mode is not a full network regression.
 
-`python -B scripts/regress.py --tag <tag>` runs the unit tests, the `full` and `multi` reference fixtures and the offline demo with and without delegation, writing logs and results to `.codeharness/regress/`; `--compare <summary.json>` diffs against an earlier run and `--skip-loopback` is equivalent to the variable above. CI runs the same script on Ubuntu and Windows with Python 3.11–3.13, without calling any real model.
+`python -B scripts/regress.py --tag <tag>` runs unit tests, the `full`, `multi` and `large` reference fixtures, and the offline demo with and without delegation. Logs and results go to `.codeharness/regress/`. Use `--compare <summary.json>` to compare with an earlier run and `--skip-loopback` as an alternative to setting the environment variable above. CI runs the same script on Ubuntu and Windows with Python 3.11–3.13.
 
 ## Design trade-offs
 

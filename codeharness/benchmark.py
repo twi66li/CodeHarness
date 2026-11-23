@@ -117,20 +117,64 @@ def repeat_statistics(cases: list[dict], repeats: int) -> dict:
         keys = list(product((task,), ("delegate", "no-delegate"), range(1, repeats + 1)))
         if all(key in outcomes for key in keys):
             paired.append(mean(outcomes[key] for key in keys[:repeats]) - mean(outcomes[key] for key in keys[repeats:]))
-    interval = None
-    if paired:
-        random = Random(0)
-        samples = sorted(mean(random.choices(paired, k=len(paired))) for _ in range(1000))
-        interval = [samples[24], samples[974]]
     return {"variants": variants, "paired": {"tasks": len(paired), "pairs": len(paired) * repeats,
-            "success_rate_delta": mean(paired) if paired else None, "bootstrap_95ci": interval}}
+            "success_rate_delta": mean(paired) if paired else None, "bootstrap_95ci": bootstrap_interval(paired)}}
+
+
+def bootstrap_interval(deltas: list[float]) -> list[float] | None:
+    if not deltas:
+        return None
+    random = Random(0)
+    samples = sorted(mean(random.choices(deltas, k=len(deltas))) for _ in range(1000))
+    return [samples[24], samples[974]]
+
+
+def compare_reports(baseline: dict, treatment: dict, *, baseline_variant=None, treatment_variant=None) -> dict:
+    def index(report, variant):
+        rows = {}
+        for row in report["cases"]:
+            model = row.get("model", report.get("model"))
+            if not model or row.get("skipped") or "usage" not in row or (variant and row.get("variant") != variant):
+                continue
+            key = model, row["task"], row.get("repeat", 1)
+            if key in rows:
+                raise ValueError("每份报告中同一模型、任务和轮次必须只有一个有效变体")
+            rows[key] = row
+        return rows
+
+    def token_count(row):
+        return row["usage"]["input_tokens"] + row["usage"]["output_tokens"]
+
+    before, after = index(baseline, baseline_variant), index(treatment, treatment_variant)
+    groups = {}
+    for model, task, repeat in sorted(before.keys() & after.keys()):
+        key = model, task, repeat
+        groups.setdefault(model, []).append((before[key], after[key]))
+
+    by_model = {}
+    for model, pairs in groups.items():
+        by_task = {}
+        for left, right in pairs:
+            by_task.setdefault(left["task"], []).append(int(right["success"]) - int(left["success"]))
+        task_deltas = [mean(deltas) for deltas in by_task.values()]
+        by_model[model] = {
+            "tasks": len(by_task),
+            "pairs": len(pairs),
+            "success_rate_delta": mean(task_deltas),
+            "bootstrap_95ci": bootstrap_interval(task_deltas),
+            "request_delta_median": median(right["usage"]["requests"] - left["usage"]["requests"]
+                                           for left, right in pairs),
+            "token_delta_median": median(token_count(right) - token_count(left) for left, right in pairs),
+        }
+    return {"by_model": by_model, "baseline_unpaired": len(before.keys() - after.keys()),
+            "treatment_unpaired": len(after.keys() - before.keys())}
 
 
 def diagnostics(store: Store) -> dict:
     """Summarize failure evidence without exporting raw messages or tool output."""
     result = {"model_errors": 0, "model_retries": 0, "tool_errors": 0, "failed_verifications": 0,
               "delegate_calls": 0, "compactions": 0, "truncations": 0,
-              "model_access_denied": False, "tool_error_counts": {}}
+              "model_access_denied": False, "quota_exhausted": False, "tool_error_counts": {}}
     estimate_errors = []
     for session in store.sessions():
         if session["parent_id"] is not None:
@@ -148,6 +192,7 @@ def diagnostics(store: Store) -> dict:
             elif kind == "model_error":
                 result["model_errors"] += 1
                 result["model_access_denied"] |= bool(data.get("access_denied"))
+                result["quota_exhausted"] |= bool(data.get("quota_exhausted"))
             elif kind == "model_retry":
                 result["model_retries"] += 1
             elif kind == "model_truncated":
@@ -308,6 +353,25 @@ def run_suite(tasks: tuple[Task, ...], output: Path, *, model: Model | None = No
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["compare"]:
+        parser = argparse.ArgumentParser(prog="codeharness.benchmark compare", description="比较两份真实评测报告")
+        parser.add_argument("--baseline", required=True, type=Path)
+        parser.add_argument("--treatment", required=True, type=Path)
+        parser.add_argument("--baseline-variant", choices=("delegate", "no-delegate"))
+        parser.add_argument("--treatment-variant", choices=("delegate", "no-delegate"))
+        args = parser.parse_args(argv[1:])
+        try:
+            baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+            treatment = json.loads(args.treatment.read_text(encoding="utf-8"))
+            result = compare_reports(baseline, treatment, baseline_variant=args.baseline_variant,
+                                     treatment_variant=args.treatment_variant)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        except (ValueError, OSError, TypeError, KeyError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 2
+
     parser = argparse.ArgumentParser(description="CodeHarness 独立验收与消融评测")
     parser.add_argument("--mode", choices=("fixtures", "model"), default="fixtures")
     selection = parser.add_mutually_exclusive_group()

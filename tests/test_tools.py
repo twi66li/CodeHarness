@@ -60,6 +60,34 @@ class ToolTests(unittest.TestCase):
             with self.assertRaisesRegex(ToolError, "只读"):
                 registry.invoke("apply_patch", {"patch": first})
 
+    def test_unified_patch_accepts_unprefixed_empty_context_line(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "a.txt"
+            path.write_text("first\n\nold\n", encoding="utf-8")
+            registry = Registry(Workspace(root), Policy(allow_write=True))
+            register_workspace_tools(registry)
+            registry.invoke("apply_patch", {"patch": "--- a.txt\n+++ a.txt\n@@ -1,3 +1,3 @@\n first\n\n-old\n+new\n"})
+            self.assertEqual(path.read_text(encoding="utf-8"), "first\n\nnew\n")
+
+    def test_unified_patch_exclusively_creates_and_rolls_back_without_hard_links(self):
+        create = "--- /dev/null\n+++ new.txt\n@@ -0,0 +1 @@\n+created\n"
+        edit = "--- old.txt\n+++ old.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old, new = root / "old.txt", root / "new.txt"
+            old.write_text("old\n", encoding="utf-8")
+            registry = Registry(Workspace(root), Policy(allow_write=True))
+            register_workspace_tools(registry)
+            with patch("codeharness.tools.os.link", side_effect=OSError("hard links unavailable")):
+                with patch("codeharness.tools.os.replace", side_effect=PermissionError("locked")):
+                    with self.assertRaises(PermissionError):
+                        registry.invoke("apply_patch", {"patch": create + edit})
+                self.assertFalse(new.exists())
+                self.assertEqual(old.read_text(encoding="utf-8"), "old\n")
+                registry.invoke("apply_patch", {"patch": create})
+            self.assertEqual(new.read_text(encoding="utf-8"), "created\n")
+
     def test_unified_patch_reverts_earlier_files_if_a_later_replace_fails(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

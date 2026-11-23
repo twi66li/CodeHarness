@@ -1,6 +1,6 @@
 """Offline regression for CodeHarness. Never calls a real model.
 
-Runs: git facts, full unittest, reference fixtures (full + multi), deterministic demo
+Runs: git facts, full unittest, reference fixtures (full + multi + large), deterministic demo
 with and without delegation. Writes logs and summary.json under
 .codeharness/regress/<tag>-<timestamp>/ (ignored by Git).
 
@@ -126,7 +126,7 @@ def main(argv=None) -> int:
     summary["unittest"] = parse_unittest(text, code)
 
     summary["fixtures"] = {}
-    for suite in ("full", "multi"):
+    for suite in ("full", "multi", "large"):
         print(f"[regress] 参考夹具 {suite} ...", flush=True)
         target = out / f"fixtures-{suite}"
         code, _, seconds = run([sys.executable, "-B", "-m", "codeharness.benchmark", "--mode", "fixtures",

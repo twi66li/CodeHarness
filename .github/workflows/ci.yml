@@ -33,7 +33,7 @@ jobs:
           git config --global init.defaultBranch main
           git config --global core.longpaths true
 
-      # Offline only: unit tests, reference fixtures (full + multi) and the deterministic demo.
+      # Offline only: unit tests, reference fixtures (full + multi + large) and the deterministic demo.
       # No model endpoint or credential is configured in CI.
       - name: Offline regression
         env:
