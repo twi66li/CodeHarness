@@ -163,6 +163,39 @@ class TransportTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_trace_timeline_keeps_event_order_and_compact_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "state.sqlite3"
+            store = Store(path)
+            try:
+                session = store.create(root, "fixture")
+                store.append(session, "message", {"role": "user", "content": "full prompt"})
+                store.append(session, "model_request", {"model": "fixture", "max_tokens": 4096,
+                    "messages": [{"role": "user", "content": "full prompt"}], "tools": []})
+                store.append(session, "context_compacted", {"original_messages": 10, "sent_messages": 5})
+                store.append(session, "tool_started", {"name": "delegate", "call_id": "call_1"})
+                store.append(session, "tool_finished", {"name": "delegate", "call_id": "call_1",
+                    "result": {"ok": True, "output": {"session_id": "child", "status": "completed", "summary": "full answer"}}})
+                store.append(session, "verification", {"passed": True, "files": {"a.py": "sha256"}})
+                store.append(session, "result", {"status": "verified", "verification": "passed", "answer": "full answer"})
+            finally:
+                store.close()
+            args = ["trace", session, "--store", str(path), "--timeline"]
+            with redirect_stdout(StringIO()) as output:
+                self.assertEqual(main([*args, "--json"]), 0)
+            self.assertNotIn("full prompt", output.getvalue())
+            self.assertNotIn("full answer", output.getvalue())
+            rows = json.loads(output.getvalue())
+            self.assertEqual([row["kind"] for row in rows], [
+                "model_request", "context_compacted", "tool_started", "tool_finished", "verification", "result",
+            ])
+            self.assertEqual(rows[3]["data"], {"name": "delegate", "call_id": "call_1", "ok": True,
+                "child_session": "child", "child_status": "completed"})
+            with redirect_stdout(StringIO()) as output:
+                self.assertEqual(main(args), 0)
+            self.assertIn("result  status=verified verification=passed", output.getvalue())
+
     def test_cli_mock_transport_runs_complete_tool_loop(self):
         captured = []
 

@@ -65,6 +65,16 @@ python -m codeharness run "给项目增加一个功能并验证" --workspace D:/
 python -m codeharness sessions --workspace D:/your/repo
 python -m codeharness resume SESSION_ID --workspace D:/your/repo --env-file .env
 python -m codeharness trace SESSION_ID --workspace D:/your/repo --json
+python -m codeharness trace SESSION_ID --workspace D:/your/repo --timeline
+```
+
+`--timeline` 按事件顺序显示模型请求、工具、压缩、委派、验证与结果，可与 `--json` 合用。以下为一次 `multi` 订单任务的 UTC 时间线节选，省略了小数秒和调用 ID。Agent 耗尽预算时还没运行工作区测试，外部独立验收已通过。
+
+```text
+15:23:33  model_request  model=deepseek-v4.1-flash max_tokens=4096
+15:23:34  tool_started   name=list_files
+15:23:50  tool_finished  name=edit_file ok=True
+15:23:54  result         status=budget_exhausted verification=not_run
 ```
 
 ## 运行机制
@@ -157,13 +167,22 @@ python -m codeharness.benchmark --mode model --task discount --model-pool .codeh
 
 | 评测项 | 结果 | 关键统计与说明 |
 | --- | --- | --- |
-| 单元测试与契约回归 | 77/78 通过（1 跳过） | 含 16 项本地 HTTP/CLI 契约测试与 4 阶段进程崩溃注入；符号链接测试因本机权限跳过 |
+| 单元测试与契约回归 | 119/121 通过（2 跳过） | 本机跳过符号链接权限测试和默认关闭的规模测试 |
 | 参考夹具独立验收 | 19/19 通过 | `full` 12 题、`multi` 3 题、`large` 4 题的初始断言均失败，参考修复均通过独立验收（0 次模型调用） |
 | `glm-5.3`（`core`，`low`，4096） | 4/5（原题面）；`invoice` 澄清后复测 1/1 | 33 次请求、65,570 Token、65.82 秒、0 模型错误；原题面独立验收暴露负数舍入边界差异 |
 | `glm-5.3`（`multi`，`low`，4096） | 3/3 全部通过 | 3 个 11 文件后端任务均精准跨 3 模块修复；22 次请求、62,579 Token、53.41 秒、0 模型错误、`write_file` 误用错误由 3 次降至 0 次 |
-| 委派子任务边界观察 | `delegate_calls = 0` | 上述样例上下文未超阈值，模型直接并行读取效率更高；实际委派收益仍需在更大仓库上另行验证 |
 
-确定性 demo（启用委派 8 次调用、禁用 5 次调用）均修复折扣并通过测试，仅用于验证执行链路而非模型能力。完整分段记录与复现命令见 [交接记录](HANDOFF.md#最新交接单)。
+**S13 真实模型对照**。每行只比较同一模型的配对，置信区间按任务做 bootstrap，单位为百分点。
+
+| 实验与模型 | 同模型配对 | 独立验收 | 成功率差与 95% 区间 |
+| --- | ---: | --- | --- |
+| S0b → 当前版本，`core`，`deepseek-v4.1-flash` | 10（5 题 × 2 轮） | 10/10 → 10/10 | 0 [0, 0] |
+| S0b → 当前版本，`multi`，`deepseek-v4.1-flash` | 6（3 题 × 2 轮） | 6/6 → 3/6 | −50 [−100, 0] |
+| 启用 → 禁用 `apply_patch`，`deepseek-v4.1-flash` | 4（3 题，1～2 轮） | 2/4 → 4/4 | +50 [0, 100] |
+| 关闭 → 开放委派，`deepseek-v4.1-flash-1017` | 6（3 题 × 2 轮） | 1/6 → 0/6 | −16.7 [−50, 0] |
+| 压缩阈值 28,000 → 8,000 字符，`deepseek-v4.1-flash-1017` | 4（2 题 × 2 轮） | 1/4 → 0/4 | −25 [−50, 0] |
+
+开放委派的 6 次运行均未实际调用该工具。压缩阈值实验中，压缩次数从 14 增至 40，请求差中位数为 +4。这些小样本观察用于确定下一轮排查范围。确定性 demo（委派开 8 次请求、关 5 次）用于验证执行链路。可使用上方评测命令复现，本地报告保存在 `.codeharness/benchmarks/`。
 
 正常环境使用 `python -m unittest discover -s tests -v` 完整回归。如果明确禁止本地回环连接，可以在 PowerShell 设置 `$env:CODEHARNESS_SKIP_LOOPBACK='1'`，显式跳过 5 项真实本地 HTTP 集成测试；模拟传输与 CLI 工具链测试仍然运行。该模式不等同于完整网络回归。
 

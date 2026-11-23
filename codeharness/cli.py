@@ -82,6 +82,33 @@ def isolated_workspace(workspace: Path) -> Path:
     return destination.resolve()
 
 
+def trace_timeline(events):
+    fields = {
+        "model_request": ("model", "max_tokens"),
+        "model_error": ("attempt", "retryable", "quota_exhausted", "preflight"),
+        "model_retry": ("next_attempt", "delay_seconds"),
+        "model_truncated": ("attempt", "max_tokens"),
+        "context_compacted": ("original_messages", "sent_messages"),
+        "tool_started": ("name", "call_id"),
+        "tool_finished": ("name", "call_id"),
+        "verification": ("passed",),
+        "result": ("status", "verification"),
+    }
+    for event in events:
+        kind, data = event["kind"], event["data"]
+        if kind not in fields:
+            continue
+        details = {key: data[key] for key in fields[kind] if key in data}
+        if kind == "tool_finished":
+            details["ok"] = data["result"].get("ok")
+            if data["name"] == "delegate" and details["ok"]:
+                child = data["result"].get("output", {})
+                if "session_id" in child:
+                    details["child_session"] = child["session_id"]
+                    details["child_status"] = child["status"]
+        yield {**event, "data": details}
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="CodeHarness：Python 编码 Agent 运行时")
     commands = root.add_subparsers(dest="command", required=True)
@@ -119,6 +146,7 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("sessions", parents=[common], help="列出主任务和子任务")
     trace = commands.add_parser("trace", parents=[common], help="查看会话事件、模型输入与工具证据")
     trace.add_argument("session_id")
+    trace.add_argument("--timeline", action="store_true", help="仅显示请求、工具、压缩、验证和结果的时间线")
     return root
 
 
@@ -142,9 +170,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "trace":
             store = Store(database.resolve())
             store.session(args.session_id)
-            events = store.events(args.session_id)
+            events = store.events(args.session_id, expand=not args.timeline)
+            if args.timeline:
+                events = list(trace_timeline(events))
             if args.json:
                 print(json.dumps(events, ensure_ascii=False, indent=2))
+            elif args.timeline:
+                for event in events:
+                    details = " ".join(f"{key}={value}" for key, value in event["data"].items())
+                    print(f"{event['time']}  {event['kind']}  {details}")
             else:
                 for event in events:
                     print(json.dumps(event, ensure_ascii=False))

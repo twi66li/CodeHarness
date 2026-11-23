@@ -65,6 +65,16 @@ Write and test-execution permissions are asked for each time by default. Non-int
 python -m codeharness sessions --workspace D:/your/repo
 python -m codeharness resume SESSION_ID --workspace D:/your/repo --env-file .env
 python -m codeharness trace SESSION_ID --workspace D:/your/repo --json
+python -m codeharness trace SESSION_ID --workspace D:/your/repo --timeline
+```
+
+`--timeline` shows model requests, tools, compaction, delegation, verification and the result in event order. It also works with `--json`. This excerpt from a `multi` order task is in UTC, with fractional seconds and call IDs omitted. The agent ran out of budget before running workspace tests. External independent acceptance passed.
+
+```text
+15:23:33  model_request  model=deepseek-v4.1-flash max_tokens=4096
+15:23:34  tool_started   name=list_files
+15:23:50  tool_finished  name=edit_file ok=True
+15:23:54  result         status=budget_exhausted verification=not_run
 ```
 
 ## How it works
@@ -159,13 +169,22 @@ Benchmark pairs run on one model. Quota exhaustion preserves the tokens already 
 
 | Item | Result | Notes |
 | --- | --- | --- |
-| Unit and contract tests | 77/78 passed (1 skipped) | Includes 16 local HTTP/CLI contract tests and 4-stage process crash injection; the symlink test is skipped for lack of local permission |
+| Unit and contract tests | 119/121 passed (2 skipped) | Symlink permissions and the opt-in scale test account for the local skips |
 | Reference fixture acceptance | 19/19 passed | `full` 12, `multi` 3, `large` 4. Every initial version fails its assertions and every reference fix passes (0 model calls) |
 | `glm-5.3` (`core`, `low`, 4096) | 4/5 (original prompt); `invoice` 1/1 after clarification | 33 requests, 65,570 tokens, 65.82 s, 0 model errors; acceptance exposed a negative-rounding difference under the original prompt |
 | `glm-5.3` (`multi`, `low`, 4096) | 3/3 passed | All three 11-file backend tasks fixed across exactly 3 modules; 22 requests, 62,579 tokens, 53.41 s, 0 model errors; `write_file` misuse errors dropped from 3 to 0 |
-| Delegation observation | `delegate_calls = 0` | Context stayed below the threshold in these cases and the model read files directly; delegation benefit still needs measuring on larger repositories |
 
-Each case was run once (n = 1), so differences between configurations are not statistically meaningful yet. The deterministic demo (8 calls with delegation, 5 without) fixes the discount and passes tests in both modes; it validates the execution path, not model capability. See [HANDOFF.md](HANDOFF.md#最新交接单) for detailed records and reproduction commands, and [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md) for the next iteration.
+**S13 real-model comparisons.** Each row uses same-model pairs. The 95% confidence intervals bootstrap over tasks and use percentage points.
+
+| Experiment and model | Same-model pairs | Independent acceptance | Success rate change with 95% CI |
+| --- | ---: | --- | --- |
+| S0b → current version, `core`, `deepseek-v4.1-flash` | 10 (5 tasks × 2 rounds) | 10/10 → 10/10 | 0 [0, 0] |
+| S0b → current version, `multi`, `deepseek-v4.1-flash` | 6 (3 tasks × 2 rounds) | 6/6 → 3/6 | −50 [−100, 0] |
+| `apply_patch` enabled → disabled, `deepseek-v4.1-flash` | 4 (3 tasks, 1–2 rounds) | 2/4 → 4/4 | +50 [0, 100] |
+| Delegation unavailable → available, `deepseek-v4.1-flash-1017` | 6 (3 tasks × 2 rounds) | 1/6 → 0/6 | −16.7 [−50, 0] |
+| Compaction threshold 28,000 → 8,000 characters, `deepseek-v4.1-flash-1017` | 4 (2 tasks × 2 rounds) | 1/4 → 0/4 | −25 [−50, 0] |
+
+The model made zero delegation calls across the six runs where the tool was available. In the threshold experiment, compactions increased from 14 to 40 and the median paired request difference was +4. These small samples inform follow-up investigation. The deterministic demo validates the execution path in 8 requests with delegation and 5 without. Use the evaluation commands above to reproduce the runs. Reports are saved locally under `.codeharness/benchmarks/`.
 
 Use `python -m unittest discover -s tests -v` for a full regression. If local loopback connections are forbidden, set `$env:CODEHARNESS_SKIP_LOOPBACK='1'` in PowerShell to explicitly skip the 5 real local HTTP integration tests; simulated transport and CLI tool-chain tests still run. That mode is not a full network regression.
 
