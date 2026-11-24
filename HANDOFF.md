@@ -9,7 +9,7 @@
 基线：059d3cc（main 与 origin/main 一致）；工作区：D:\Code\python\CodeHarness
 结论：大体通过。G1、G3、G4、G5、G6、G7、G8 通过；G2 部分通过（剩余 4 条失败的原因判断有误）
 真实调用：本清单全部离线完成，不需要调用模型
-状态：H1～H4 已完成，H5～H6 待收尾
+状态：H1～H4 已验收，H5～H6 改动已完成，等待 GitHub CI 验收
 ```
 
 ### 验收结论
@@ -70,9 +70,9 @@ G6 与 G7 合计约 102 万 Token，在 300 万上限之内。
 | H1 | ☑ | `6c48acc`。三类格式和 SQL 删除行歧义的定向测试 13/13。[回归](.codeharness/regress/h1-20261124-170624/summary.json) |
 | H2 | ☑ | `926bb5f`。27/27 条补丁应用成功，80 次 Python 文件 `ast.parse` 全通过。回归 133 项中 131 项通过、2 项跳过，夹具 19/19，demo 请求数为 8/5。[回归](.codeharness/regress/h2-20261124-170756/summary.json) |
 | H3 | ☑ | `2ba0ea1`。G6 启用组补丁成功 3 次、失败 1 次，会话事件确认失败请求使用 OpenAI 格式。G7 启用和禁用委派各 0/1，均触发单题 120,000 Token 预算停止，委派调用各 0 次。[G6 启用报告](.codeharness/benchmarks/magpie-g6-patch-on/report.json) · [G7 试探报告](.codeharness/benchmarks/magpie-g7-probe/report.json) |
-| H4 | ☑ | 开工时有 `.gitignore`、`HANDOFF.md`、`IMPROVEMENT_PLAN.md`、`README.md` 既有改动，以及未跟踪的 `.claudeignore` 和 `CLAUDE.md`。按用户决定删除两份 Claude 文件，采用最新交接与计划，保留中文 README 精简版，`.gitignore` 留在本地。S4 提交号已更正为 `02b6f571`。 |
-| H5 | ☐ | |
-| H6 | ☐ | CI 链接： |
+| H4 | ☑ | `6045268`。开工时有 `.gitignore`、`HANDOFF.md`、`IMPROVEMENT_PLAN.md`、`README.md` 既有改动，以及未跟踪的 `.claudeignore` 和 `CLAUDE.md`。按用户决定删除两份 Claude 文件，采用最新交接与计划，保留中文 README 精简版，`.gitignore` 留在本地。S4 提交号已更正为 `02b6f571`。本轮提交的文档为 `HANDOFF.md`、`IMPROVEMENT_PLAN.md`、`README.md`、`README.en.md`。 |
+| H5 | ◐ | `aa1697b`。升级 `checkout@v5`、`setup-python@v6`、`upload-artifact@v6`，沿用现有六组合。等待 CI。 |
+| H6 | ◐ | 中英文 README 已更新补丁格式说明、27/27 回放和本地回归数字。等待 CI。 |
 | 待用户决定 | — | H4 的文档处理方式已确认。 |
 
 两次公开 CLI `compare` 均比较同一 Magpie 模型的 3 道题、6 个配对，两侧未配对数均为 0。下表各差值按对照后的结果减去基线计算。
