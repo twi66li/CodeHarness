@@ -84,6 +84,69 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(first.read_text(encoding="utf-8"), "heading\nunchanged\nending\n")
             self.assertEqual(second.read_text(encoding="utf-8"), "new\n")
 
+    def test_unified_patch_accepts_missing_new_header_between_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first, second = root / "a.sql", root / "b.sql"
+            first.write_text("old a\n", encoding="utf-8")
+            second.write_text("old b\n", encoding="utf-8")
+            registry = Registry(Workspace(root), Policy(allow_write=True))
+            register_workspace_tools(registry)
+            registry.invoke("apply_patch", {"patch": (
+                "--- a/a.sql\n+++ b/a.sql\n@@\n-old a\n+new a\n"
+                "--- a/b.sql\n@@\n-old b\n+new b\n"
+            )})
+            self.assertEqual(first.read_text(encoding="utf-8"), "new a\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "new b\n")
+
+    def test_unified_patch_accepts_end_markers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "a.txt"
+            registry = Registry(Workspace(root), Policy(allow_write=True))
+            register_workspace_tools(registry)
+            for marker in ("*** End Patch", "--- End Patch"):
+                with self.subTest(marker=marker):
+                    path.write_text("old\n", encoding="utf-8")
+                    registry.invoke("apply_patch", {"patch": (
+                        f"--- a.txt\n+++ a.txt\n@@\n-old\n+new\n{marker}\n"
+                    )})
+                    self.assertEqual(path.read_text(encoding="utf-8"), "new\n")
+
+    def test_unified_patch_preserves_sql_comment_removal_at_hunk_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "query.sql"
+            path.write_text("-- comment\nkeep\n", encoding="utf-8")
+            registry = Registry(Workspace(root), Policy(allow_write=True))
+            register_workspace_tools(registry)
+            registry.invoke("apply_patch", {"patch": (
+                "--- query.sql\n+++ query.sql\n@@\n--- comment\n@@\n-keep\n+updated\n"
+            )})
+            self.assertEqual(path.read_text(encoding="utf-8"), "updated\n")
+
+    def test_openai_patch_updates_adds_and_deletes_without_partial_writes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            updated, deleted, added = (root / name for name in ("update.py", "old.bin", "new.py"))
+            updated.write_bytes(b"\xef\xbb\xbfx = 1\r\n")
+            deleted.write_bytes(b"\xffold")
+            registry = Registry(Workspace(root), Policy(allow_write=True))
+            register_workspace_tools(registry)
+            begin = "*** Begin Patch\n"
+            update = "*** Update File: update.py\n@@\n-x = 1\n+x = 2\n"
+            with self.assertRaisesRegex(ToolError, "Move to"):
+                registry.invoke("apply_patch", {"patch": begin + update + "*** Move to: other.py\n*** End Patch\n"})
+            with self.assertRaisesRegex(ToolError, "超出工作区"):
+                registry.invoke("apply_patch", {"patch": begin + update + "*** Delete File: ../outside\n*** End Patch\n"})
+            self.assertEqual(updated.read_bytes(), b"\xef\xbb\xbfx = 1\r\n")
+            registry.invoke("apply_patch", {"patch": (
+                begin + update + "*** Add File: new.py\n+y = 3\n*** Delete File: old.bin\n*** End Patch\n"
+            )})
+            self.assertEqual(updated.read_bytes(), b"\xef\xbb\xbfx = 2\r\n")
+            self.assertEqual(added.read_bytes(), b"y = 3\n")
+            self.assertFalse(deleted.exists())
+
     def test_unified_patch_tolerates_wrong_counts_but_requires_position_for_pure_insert(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

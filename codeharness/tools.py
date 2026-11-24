@@ -134,65 +134,133 @@ def digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def parse_unified_patch(patch: str):
+def read_patch_hunks(lines, index, path, at_boundary=None):
+    hunks = []
+    while index < len(lines) and lines[index].startswith("@@"):
+        head = lines[index].rstrip("\n")
+        number = len(hunks) + 1
+        if head != "@@" and "@@" not in head[2:]:
+            raise ToolError(f"{path} 的第 {number} 个片段头无效，请使用 @@ 或完整的 @@ ... @@")
+        location = re.match(r"@@\s*-(\d+)(?=[,\s]|$)", head)
+        offset = int(location[1]) if location else None
+        index += 1
+        before, after = [], []
+        while index < len(lines):
+            raw = lines[index]
+            if raw.startswith("@@") or (at_boundary is not None and at_boundary(index)):
+                break
+            if raw == "\n":
+                raw = " \n"
+            sign, line = raw[0], raw[1:]
+            if sign not in {" ", "+", "-"}:
+                raise ToolError(f"{path} 的第 {number} 个片段缺少正文前缀，请用空格、- 或 +")
+            index += 1
+            if index < len(lines) and lines[index].rstrip("\n") == "\\ No newline at end of file":
+                line = line.removesuffix("\n")
+                index += 1
+            elif not line.endswith("\n"):
+                line += "\n"
+            if sign != "+":
+                before.append(line)
+            if sign != "-":
+                after.append(line)
+        if not (before or after):
+            raise ToolError(f"{path} 的第 {number} 个片段没有正文")
+        if offset is None and not before:
+            raise ToolError(f"{path} 的第 {number} 个片段为纯插入，请提供旧文件起始行号")
+        hunks.append((offset, before, after))
+    if not hunks:
+        raise ToolError(f"{path} 没有补丁片段")
+    return hunks, index
+
+
+def parse_openai_patch(lines):
+    if any(line.startswith("*** Move to:") for line in lines):
+        raise ToolError("OpenAI 风格补丁不支持 *** Move to:")
+    index = 0
+    while index < len(lines):
+        heading = lines[index].rstrip("\n")
+        operation, separator, path = heading.partition(": ")
+        if not separator or not path or path == "/dev/null":
+            raise ToolError(f"无效的 OpenAI 补丁文件头：{heading}")
+        index += 1
+        start = index
+        while index < len(lines) and not lines[index].startswith("*** "):
+            index += 1
+        body = lines[start:index]
+        if operation == "*** Update File":
+            hunks, end = read_patch_hunks(body, 0, path)
+            if end != len(body):
+                raise ToolError(f"{path} 的补丁有未识别的正文")
+            yield path, path, hunks
+        elif operation == "*** Add File":
+            if any(not line.startswith("+") for line in body):
+                raise ToolError(f"{path} 的 Add File 正文每行都需要 +")
+            yield "/dev/null", path, [(0, [], [line[1:] for line in body])]
+        elif operation == "*** Delete File":
+            if any(line.strip() for line in body):
+                raise ToolError(f"{path} 的 Delete File 不接受正文")
+            yield path, "/dev/null", None
+        else:
+            raise ToolError(f"无效的 OpenAI 补丁操作：{operation}")
+
+
+def parse_unified_patch(patch: str, workspace: Workspace):
     lines = patch.replace("\r\n", "\n").splitlines(keepends=True)
+    first = next((i for i, line in enumerate(lines) if line.strip()), len(lines))
     last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
-    if last is not None and lines[last].rstrip("\n") == "*** End Patch":
+    has_end = last is not None and lines[last].rstrip("\n") in {"*** End Patch", "--- End Patch"}
+    if first < len(lines) and lines[first].rstrip("\n") == "*** Begin Patch":
+        if not has_end:
+            raise ToolError("OpenAI 风格补丁缺少 *** End Patch")
+        yield from parse_openai_patch(lines[first + 1:last])
+        return
+    if has_end:
         lines = lines[:last]
     metadata = ("diff --git ", "index ", "new file mode ", "deleted file mode ")
+
+    def is_file(path):
+        try:
+            return workspace.path(path).is_file()
+        except ToolError:
+            return False
+
+    def headers(index):
+        if index + 1 >= len(lines) or not lines[index].startswith("--- "):
+            return None
+        old = lines[index][4:].rstrip("\n").split("\t", 1)[0]
+        following = lines[index + 1]
+        if following.startswith("@@"):
+            if old.startswith("a/") and not is_file(old):
+                old = old[2:]
+            return old, old, index + 1
+        if not following.startswith("+++ "):
+            return None
+        new = following[4:].rstrip("\n").split("\t", 1)[0]
+        if old.startswith("a/") and (new.startswith("b/") or new == "/dev/null"):
+            old = old[2:]
+        if new.startswith("b/") and (old == "/dev/null" or old == new[2:]):
+            new = new[2:]
+        return old, new, index + 2
+
+    def at_boundary(index):
+        if lines[index].startswith(metadata):
+            return True
+        candidate = headers(index)
+        return candidate is not None and (candidate[0] == "/dev/null" or is_file(candidate[0]))
+
     index = 0
     while index < len(lines):
         if not lines[index].strip() or lines[index].startswith(metadata):
             index += 1
             continue
-        if index + 1 >= len(lines) or not lines[index].startswith("--- ") or not lines[index + 1].startswith("+++ "):
+        header = headers(index)
+        if header is None:
             raise ToolError(f"补丁第 {index + 1} 行缺少成对的文件头，请使用 --- 路径和 +++ 路径")
-        old = lines[index][4:].rstrip("\n").split("\t", 1)[0]
-        new = lines[index + 1][4:].rstrip("\n").split("\t", 1)[0]
-        if old.startswith("a/") and (new.startswith("b/") or new == "/dev/null"):
-            old = old[2:]
-        if new.startswith("b/") and (old == "/dev/null" or old == new[2:]):
-            new = new[2:]
+        old, new, index = header
         if not old or not new or (old != new and "/dev/null" not in (old, new)) or old == new == "/dev/null":
             raise ToolError("文件头必须指向同一文件，新增或删除用 /dev/null")
-        index += 2
-        hunks = []
-        while index < len(lines) and lines[index].startswith("@@"):
-            head = lines[index].rstrip("\n")
-            if head != "@@" and "@@" not in head[2:]:
-                raise ToolError(f"{old} 的第 {len(hunks) + 1} 个片段头无效，请使用 @@ 或完整的 @@ ... @@")
-            location = re.match(r"@@\s*-(\d+)(?=[,\s]|$)", head)
-            offset = int(location[1]) if location else None
-            index += 1
-            before, after = [], []
-            while index < len(lines):
-                raw = lines[index]
-                if (raw.startswith(("@@", *metadata))
-                    or (raw.startswith("--- ") and index + 2 < len(lines)
-                        and lines[index + 1].startswith("+++ ") and lines[index + 2].startswith("@@"))):
-                    break
-                if raw == "\n":
-                    raw = " \n"
-                sign, line = raw[0], raw[1:]
-                if sign not in {" ", "+", "-"}:
-                    raise ToolError(f"{old} 的第 {len(hunks) + 1} 个片段缺少正文前缀，请用空格、- 或 +")
-                index += 1
-                if index < len(lines) and lines[index].rstrip("\n") == "\\ No newline at end of file":
-                    line = line.removesuffix("\n")
-                    index += 1
-                elif not line.endswith("\n"):
-                    line += "\n"
-                if sign != "+":
-                    before.append(line)
-                if sign != "-":
-                    after.append(line)
-            if not (before or after):
-                raise ToolError(f"{old} 的第 {len(hunks) + 1} 个片段没有正文")
-            if offset is None and not before:
-                raise ToolError(f"{old} 的第 {len(hunks) + 1} 个片段为纯插入，请提供旧文件起始行号")
-            hunks.append((offset, before, after))
-        if not hunks:
-            raise ToolError(f"{old} 没有补丁片段")
+        hunks, index = read_patch_hunks(lines, index, new if old == "/dev/null" else old, at_boundary)
         yield old, new, hunks
 
 
@@ -584,7 +652,7 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None):
     def apply_patch(patch):
         updates = []
         seen = set()
-        for old, new, hunks in parse_unified_patch(patch):
+        for old, new, hunks in parse_unified_patch(patch, workspace):
             path = new if new != "/dev/null" else old
             target = workspace.path(path)
             if target in seen:
@@ -594,6 +662,9 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None):
             if exists != (old != "/dev/null") or (exists and not target.is_file()):
                 raise ToolError(f"补丁文件头与磁盘状态不符：{path}")
             before = target.read_bytes() if exists else None
+            if hunks is None:
+                updates.append((path, target, before, None))
+                continue
             text = before.decode("utf-8-sig") if before is not None else ""
             fixed = patch_text(path, text, hunks)
             if new == "/dev/null" and fixed:
