@@ -10,7 +10,7 @@ import uuid
 
 from .demo import DemoModel, create_demo
 from .model_pool import ModelPool
-from .models import ChatModel
+from .models import AnthropicModel, ChatModel
 from .runtime import Agent, Limits
 from .store import Store
 from .tools import Policy, shell_command, test_subprocess_env
@@ -57,11 +57,26 @@ def load_env(path: Path | None) -> dict[str, str]:
     return loaded
 
 
-def model_connection(env: dict[str, str], base_url: str | None) -> tuple[str | None, str]:
+def model_connection(env: dict[str, str], base_url: str | None, provider: str = "openai") -> tuple[str | None, str]:
+    if provider == "anthropic":
+        url = base_url or env.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+        return url, env.get("ANTHROPIC_API_KEY", "")
     url = base_url or env.get("CODEHARNESS_BASE_URL") or env.get("OPENAI_BASE_URL")
     if url:
         return url, env.get("CODEHARNESS_API_KEY") or env.get("OPENAI_API_KEY", "")
     return env.get("DASHSCOPE_BASE_URL"), env.get("DASHSCOPE_API_KEY", "")
+
+
+def build_model(model_name: str, *, provider: str, env: dict[str, str], base_url: str | None,
+                timeout: float, reasoning_effort: str | None):
+    if model_name == "offline-demo":
+        return DemoModel()
+    url, key = model_connection(env, base_url, provider=provider)
+    if not model_name or not url:
+        raise ValueError("请设置模型名与接口地址。可先运行 python -m codeharness demo 检查离线流程。")
+    if provider == "anthropic":
+        return AnthropicModel(model_name, url, key, timeout=timeout)
+    return ChatModel(model_name, url, key, timeout=timeout, reasoning_effort=reasoning_effort)
 
 
 def isolated_workspace(workspace: Path) -> Path:
@@ -120,6 +135,8 @@ def parser() -> argparse.ArgumentParser:
     execution = argparse.ArgumentParser(add_help=False)
     execution.add_argument("--env-file", type=Path, help="显式读取本地 NAME=value 配置，环境变量优先")
     execution.add_argument("--model", help="也可设置 CODEHARNESS_MODEL 或 OPENAI_MODEL")
+    execution.add_argument("--provider", choices=["openai", "anthropic"], default="openai",
+                           help="模型协议：openai（Chat Completions 兼容）或 anthropic（原生 Messages）")
     execution.add_argument("--model-pool", type=Path, help="模型额度和台账配置 JSON")
     execution.add_argument("--models", help="覆盖模型池顺序，使用逗号分隔")
     execution.add_argument("--reasoning-effort", help="模型支持时设置推理强度，例如 low")
@@ -178,7 +195,7 @@ def _tool_preview(name: str, arguments) -> str:
 
 def run_chat(agent: Agent, workspace: Path, store: Store, policy: Policy, *,
              session_id: str | None = None, stream: bool = True,
-             input_fn=input, output=None) -> int:
+             input_fn=input, output=None, switch_model=None) -> int:
     out = output or sys.stdout
     sid = session_id
     state = {"mode": None, "printed": False}
@@ -239,7 +256,7 @@ def run_chat(agent: Agent, workspace: Path, store: Store, policy: Policy, *,
             break
         if line == "/help":
             emit("命令：/help 帮助 | /tools 工具 | /session 会话 | /compact [重点] 压缩 | "
-                 "!命令 | /exit 退出")
+                 "/tree 会话树 | /fork [回合] [备注] 分叉 | /switch <ID> 切分支 | /model [名] 换模型 | !命令 | /exit 退出")
             ext_cmds = agent.commands()
             if ext_cmds:
                 emit("扩展命令：" + " | ".join(f"/{cmd.name} {cmd.description}" for cmd in ext_cmds.values()))
@@ -255,6 +272,91 @@ def run_chat(agent: Agent, workspace: Path, store: Store, policy: Policy, *,
                 usage = store.usage(sid)
                 emit(f"会话：{sid} | 工作区：{workspace} | 模型：{agent.model.name}")
                 emit("用量：" + json.dumps(usage, ensure_ascii=False))
+            continue
+        if line == "/tree":
+            if not sid:
+                emit("尚未开始会话，暂无会话树。")
+                continue
+            tree = store.session_tree(sid)
+            emit("=== 会话分支树 ===")
+            for node in tree["branches"]:
+                indent = "  " * node["depth"]
+                mark = "* " if node["current"] else "  "
+                origin = f" (from ev:{node['from_event_id']})" if node["from_event_id"] else ""
+                label = f" [{node['label']}]" if node["label"] else ""
+                emit(f"{mark}{indent}{node['id']}  {node['model']}  {node['status']}{origin}{label}")
+            emit("=== 当前分支回合 ===")
+            for turn in tree["turns"]:
+                emit(f"  #{turn['turn']} [ev:{turn['event_id']}] {turn['user']} -> {turn['assistant']}")
+            if not tree["turns"]:
+                emit("  （暂无已完成回合）")
+            continue
+        if line == "/fork" or line.startswith("/fork "):
+            if not sid:
+                emit("尚未开始会话，无法分叉。")
+                continue
+            rest = line[len("/fork"):].strip()
+            cutoff = None
+            label = ""
+            if rest:
+                parts = rest.split(None, 1)
+                head = parts[0]
+                tail = parts[1] if len(parts) == 2 else ""
+                turns = store.turns(sid)
+                if head.startswith("ev:") and head[3:].isdigit():
+                    cutoff = int(head[3:])
+                    label = tail
+                elif head.lstrip("#").isdigit():
+                    idx = int(head.lstrip("#"))
+                    if not 1 <= idx <= len(turns):
+                        emit(f"回合号超出范围（1～{len(turns)}）。")
+                        continue
+                    cutoff = turns[idx - 1]["event_id"]
+                    label = tail
+                else:
+                    label = rest
+            try:
+                old_sid = sid
+                new_sid = store.fork(sid, up_to_event_id=cutoff, label=label)
+                agent.copy_session_pins(old_sid, new_sid)
+                sid = new_sid
+                emit(f"已分叉并切换到新分支：{sid}" + (f" [{label}]" if label else ""))
+            except ValueError as exc:
+                emit(f"分叉失败：{exc}")
+            continue
+        if line == "/switch" or line.startswith("/switch "):
+            target = line[len("/switch"):].strip()
+            if not target:
+                emit("用法：/switch <会话ID>")
+                continue
+            try:
+                row = store.session(target)
+                if Path(row["workspace"]).resolve() != workspace.resolve():
+                    emit("目标会话不属于当前工作区。")
+                    continue
+                if row["parent_id"] is not None:
+                    emit("不能切换到只读子任务会话。")
+                    continue
+                sid = target
+                emit(f"已切换到分支：{sid}")
+            except ValueError as exc:
+                emit(str(exc))
+            continue
+        if line == "/model" or line.startswith("/model "):
+            spec = line[len("/model"):].strip()
+            if not spec:
+                proto = "anthropic" if isinstance(agent.model, AnthropicModel) else "openai"
+                emit(f"当前模型：{agent.model.name}（协议：{proto}）")
+                continue
+            if switch_model is None or isinstance(agent.model, ModelPool):
+                emit("当前模式未配置模型热切换，模型池继续按配置运行。")
+                continue
+            try:
+                previous = agent.model.name
+                agent.model = switch_model(spec)
+                emit(f"已切换模型：{previous} → {agent.model.name}")
+            except ValueError as exc:
+                emit(f"切换模型失败：{exc}")
             continue
         if line == "/compact" or line.startswith("/compact "):
             if not sid:
@@ -359,11 +461,15 @@ def main(argv: list[str] | None = None) -> int:
             sid = None
             enable_bash = False
             tool_profile = "default"
+            env = {}
+            provider = "openai"
             if not args.json:
                 print("离线演示：使用确定性适配器，不调用 AI，不产生真实模型评测成绩。")
         else:
             env = {**load_env(args.env_file), **os.environ}
-            model_name = args.model or env.get("CODEHARNESS_MODEL") or env.get("OPENAI_MODEL")
+            provider = args.provider
+            model_name = args.model or env.get("CODEHARNESS_MODEL") or (
+                env.get("ANTHROPIC_MODEL") if provider == "anthropic" else env.get("OPENAI_MODEL"))
             sid = getattr(args, "session_id", None) if args.command in {"resume", "chat"} else None
             if sid:
                 store = Store(database.resolve())
@@ -379,16 +485,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.model_pool:
                 if args.model or args.base_url:
                     raise ValueError("--model-pool 使用池配置中的模型和接口地址")
+                if provider != "openai":
+                    raise ValueError("--model-pool 当前仅支持 openai 协议")
                 model = ModelPool(args.model_pool, env=env, order=args.models,
                                   reasoning_effort=args.reasoning_effort, switch_mid_session=True)
-            elif model_name == "offline-demo":
-                model = DemoModel()
             else:
-                base_url, key = model_connection(env, args.base_url)
-                if not model_name or not base_url:
-                    raise ValueError("请设置模型名与接口地址。可先运行 python -m codeharness demo 检查离线流程。")
-                model = ChatModel(model_name, base_url, key, timeout=min(60, args.max_seconds),
-                                  reasoning_effort=args.reasoning_effort)
+                model = build_model(model_name or "", provider=provider, env=env, base_url=args.base_url,
+                                    timeout=min(60, args.max_seconds), reasoning_effort=args.reasoning_effort)
             if args.command == "run" and args.isolate:
                 workspace = isolated_workspace(workspace)
             def confirm(name, arguments):
@@ -416,13 +519,30 @@ def main(argv: list[str] | None = None) -> int:
             store = Store(database.resolve())
 
         if args.command == "chat":
+            active_provider = provider
+
+            def switch_model(spec: str):
+                nonlocal active_provider
+                target_provider = active_provider
+                target_name = spec
+                if ":" in spec:
+                    prefix, rest = spec.split(":", 1)
+                    if prefix in {"openai", "anthropic"} and rest.strip():
+                        target_provider, target_name = prefix, rest.strip()
+                target_url = args.base_url if target_provider == provider else None
+                target = build_model(target_name, provider=target_provider, env=env, base_url=target_url,
+                                     timeout=min(60, args.max_seconds), reasoning_effort=args.reasoning_effort)
+                active_provider = target_provider
+                return target
+
             agent = Agent(model, workspace, store, policy, limits, plugins,
                           enable_delegate=not getattr(args, "no_delegate", False),
                           disabled_tools=getattr(args, "disable_tool", ()),
                           enable_bash=enable_bash, tool_profile=tool_profile,
                           enable_memory=not args.no_memory, discover_extensions=args.discover_extensions)
             try:
-                return run_chat(agent, workspace, store, policy, session_id=sid, stream=not args.no_stream)
+                return run_chat(agent, workspace, store, policy, session_id=sid, stream=not args.no_stream,
+                                switch_model=switch_model)
             finally:
                 agent.close()
 

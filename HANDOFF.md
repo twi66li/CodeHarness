@@ -2,6 +2,35 @@
 
 接手本仓库开发前，请按 [AGENTS.md](AGENTS.md) 核对 `git status --short --branch` 与 `git rev-parse HEAD`，以实际源码和实测为准。
 
+## 交互开发、扩展生态与三层记忆演进｜2026-11-26 v1～v3
+
+```text
+任务：v1（本地交互 chat + bash + SSE 流式）、v2（Pi 风格 ExtensionAPI + 三层会话记忆）、v3（树状会话分支 + Anthropic 原生协议与 /model 热切换）；负责人：Antigravity
+基线：94eb07c2ed0b649f8ea7c24ac497f33d04872d64；工作区：D:\Code\python\CodeHarness；分支：main
+范围：codeharness/cli.py、context.py、extensions.py、memory.py、model_pool.py、models.py、runtime.py、store.py、tools.py；examples/bash_guard.py；tests/test_interactive.py、test_extensions_memory.py、test_v3_tree_anthropic.py
+交付：Codex 完成审查，按 v1 / v2 / v3 分为三个本地提交。v1：23c0ec5；v2：ddab639；v3：包含本交接更新的提交。保留原有本地 .gitignore 改动。
+验证：v1 暂存版本 24 项定向测试通过；v2 暂存版本 13 项定向测试通过；完整工作区回归 154 项中 152 项通过、2 项跳过，参考夹具 19/19，demo 启用/禁用委派均为 verified（8/5 次请求）。
+未验证：真实模型 SSE、Anthropic 线上网关、远程 CI。当前交付为本地提交。
+```
+
+### 变更摘要（v1～v3）
+
+| 版本 | 核心能力 | 涉及文件 | 对应测试 |
+| --- | --- | --- | --- |
+| **v1** | 新增本地交互 `chat` 模式（默认开启流式与 `bash`，按 `pi` 理念默认免逐次确认，支持 `--confirm`、`--no-bash`、`--tool-profile pi` 精简 4 工具模式、`!命令`、`/compact` 与 `Ctrl+C` 中断纠偏）；纯标准库 `ChatModel` SSE 流式（含 `reasoning_content` 与分片 `tool_calls`）；`ModelPool` 透传流式回调 | `codeharness/tools.py`、`codeharness/models.py`（SSE 部分）、`codeharness/model_pool.py`、`codeharness/context.py`、`codeharness/runtime.py`（流式与 `compact` 部分）、`codeharness/cli.py`（v1 部分） | `tests/test_interactive.py`（7/7 通过） |
+| **v2** | 进程内 `ExtensionAPI` / `ExtensionHost` 支持注册工具、斜杠命令、6 个生命周期钩子及旧 `register(registry)` 扩展。`--discover-extensions` 启用工作区扩展自动发现。三层记忆支持 L1 SQLite 置顶、L2 SQLite FTS5 + TTL 和 L3 分类 Markdown | `extensions.py`、`memory.py`、`runtime.py`、`context.py`、`cli.py`、`examples/bash_guard.py` | `tests/test_extensions_memory.py`（6/6） |
+| **v3** | `branch_origin` 记录分支，`/tree`、`/fork`、`/switch` 可交互查看与切换。分叉复制可达产物与已启用的 L1 置顶。`AnthropicModel` 支持原生 `/v1/messages` 普通响应与 SSE，`/model` 可在本会话切换协议或模型 | `store.py`、`models.py`、`runtime.py`、`cli.py` | `tests/test_v3_tree_anthropic.py`（8/8） |
+
+### 审查与验收
+
+- v1 保住 `run` 与 `resume` 的原预算，`pi` 只暴露核心工具，拒绝接收未正常结束的流式工具批次。
+- v2 自动发现需要显式开启，模型写删记忆使用写授权。自动和手动压缩都会通知扩展。
+- v3 跨协议切换使用各自地址和密钥。分叉保留工具执行证据，对结果未知的写入提示先检查。Anthropic 用量包含缓存读取和写入的输入 Token。
+
+完整回归在 v2 提交后、v3 提交前使用最终源码执行。[回归报告](.codeharness/regress/v123-review-20261126-215756/summary.json)
+
+---
+
 ## 验收与修复清单｜2026-11-24 G1～G8（H1～H6，Codex 单人串行）
 
 ```text

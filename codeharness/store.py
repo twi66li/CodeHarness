@@ -271,3 +271,154 @@ class Store:
                 self.append(sid, "tool_reconciled", {"call_id": cid, "completed": cid in finished,
                                                      "started": cid in started})
                 answered.add(cid)
+
+    # ---------- Session Tree (Fork & Inspect) ----------
+
+    def turns(self, sid: str) -> list[dict]:
+        """List branchable turn checkpoints (completed assistant replies) in a session."""
+        self.session(sid)
+        events = self.events(sid, expand=False)
+        turns: list[dict] = []
+        last_user = ""
+        for event in events:
+            if event["kind"] != "message":
+                continue
+            msg = event["data"]
+            role = msg.get("role")
+            if role == "user":
+                content = str(msg.get("content", ""))
+                if not content.startswith("[") and not content.startswith("恢复检查："):
+                    last_user = content.partition("\n")[0][:80]
+            elif role == "assistant" and not msg.get("tool_calls"):
+                turns.append({
+                    "turn": len(turns) + 1,
+                    "event_id": event["id"],
+                    "user": last_user,
+                    "assistant": str(msg.get("content", "")).splitlines()[0][:80] if msg.get("content") else "",
+                    "time": event["time"],
+                })
+        return turns
+
+    def fork(self, sid: str, up_to_event_id: int | None = None, *, label: str = "") -> str:
+        """Fork a new writable branch session up to a specific event id (or latest)."""
+        source = self.session(sid)
+        if source["parent_id"] is not None:
+            raise ValueError("不能从只读子任务分叉，请从主会话分叉")
+        events = self.events(sid, expand=True)
+        if not events:
+            raise ValueError("原会话没有可分叉的事件")
+        cutoff = up_to_event_id if up_to_event_id is not None else events[-1]["id"]
+        selected = [e for e in events if e["id"] <= cutoff]
+        if not selected:
+            raise ValueError(f"事件 ID {cutoff} 不在会话 {sid} 中")
+        if up_to_event_id is not None and not any(e["id"] == cutoff for e in selected):
+            raise ValueError(f"会话 {sid} 中不存在事件 ID {cutoff}")
+
+        if not any(event["kind"] == "baseline" for event in selected):
+            raise ValueError("分叉位置早于工作区基线")
+
+        new_sid = self.create(Path(source["workspace"]), source["model"], parent_id=None)
+        artifact_map: dict[str, str] = {}
+
+        def remap_artifact(data):
+            old_id = data.get("artifact_id")
+            if not isinstance(old_id, str):
+                return False
+            if old_id not in artifact_map:
+                try:
+                    content = self.read_artifact(sid, old_id)
+                except ValueError:
+                    return False
+                artifact_map[old_id] = self.artifact(new_sid, content)
+            data["artifact_id"] = artifact_map[old_id]
+            return True
+
+        def remap_json_field(data, field):
+            try:
+                payload = json.loads(data[field])
+            except (KeyError, ValueError, TypeError):
+                return
+            if isinstance(payload, dict) and remap_artifact(payload):
+                data[field] = json.dumps(payload, ensure_ascii=False)
+
+        def remap_message(message):
+            if message.get("role") == "tool":
+                remap_json_field(message, "content")
+            for call in message.get("tool_calls", ()):
+                if call["function"]["name"] == "read_artifact":
+                    remap_json_field(call["function"], "arguments")
+
+        self.append(new_sid, "branch_origin", {
+            "from_session": sid,
+            "from_event_id": selected[-1]["id"],
+            "label": label.strip(),
+        })
+        copy_kinds = {"baseline", "message", "skill_loaded", "skill_injected",
+                      "compact_checkpoint", "checkpoint", "verification", "tool_started", "tool_finished"}
+        for event in selected:
+            kind, data = event["kind"], event["data"]
+            if kind == "message":
+                remap_message(data)
+            elif kind == "compact_checkpoint":
+                for message in data["messages"]:
+                    remap_message(message)
+            elif kind == "tool_finished":
+                remap_artifact(data["result"])
+            elif kind == "verification":
+                remap_artifact(data)
+            if kind in copy_kinds:
+                self.append(new_sid, kind, data)
+        self.repair_pending(new_sid)
+        self.status(new_sid, "completed")
+        return new_sid
+
+    def branch_origin(self, sid: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT data FROM events WHERE session_id=? AND kind='branch_origin' ORDER BY id ASC LIMIT 1",
+            (sid,)).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def session_tree(self, sid: str) -> dict:
+        """Build the branch lineage tree containing the given session."""
+        self.session(sid)
+        all_sessions = {row["id"]: row for row in self.sessions() if row["parent_id"] is None}
+        origins: dict[str, dict] = {}
+        for row in self.db.execute("SELECT session_id, data FROM events WHERE kind='branch_origin' ORDER BY id"):
+            origins.setdefault(row["session_id"], json.loads(row["data"]))
+
+        # Climb to the ancestor root of this branch family.
+        root = sid
+        seen = {root}
+        while root in origins and origins[root]["from_session"] in all_sessions:
+            parent = origins[root]["from_session"]
+            if parent in seen:
+                break
+            seen.add(parent)
+            root = parent
+
+        children: dict[str, list[str]] = {}
+        for child_id, origin in origins.items():
+            if child_id in all_sessions:
+                children.setdefault(origin["from_session"], []).append(child_id)
+
+        nodes: list[dict] = []
+
+        def walk(curr: str, depth: int):
+            meta = all_sessions.get(curr)
+            if not meta:
+                return
+            origin = origins.get(curr)
+            nodes.append({
+                "id": curr,
+                "depth": depth,
+                "current": curr == sid,
+                "model": meta["model"],
+                "status": meta["status"],
+                "from_event_id": origin["from_event_id"] if origin else None,
+                "label": origin.get("label", "") if origin else "",
+            })
+            for child in children.get(curr, ()):
+                walk(child, depth + 1)
+
+        walk(root, 0)
+        return {"root": root, "current": sid, "branches": nodes, "turns": self.turns(sid)}

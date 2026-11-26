@@ -10,7 +10,7 @@
 
 ```mermaid
 flowchart LR
-    CLI["cli.py<br/>run / resume / demo / sessions / trace"] --> Agent
+    CLI["cli.py<br/>chat / run / resume / demo / sessions / trace"] --> Agent
     Bench["benchmark.py<br/>fixtures / model 评测"] --> Agent
     Bench --> Accept["独立验收脚本<br/>位于 Agent 工作区之外"]
 
@@ -23,7 +23,7 @@ flowchart LR
         Check --> Budget
     end
 
-    Call --> Model["models.ChatModel<br/>Chat Completions 兼容"]
+    Call --> Model["models.py<br/>Chat Completions / Anthropic Messages"]
     Prepare --> Ctx["context.Context<br/>AGENTS.md · Skills · 压缩"]
     Batch --> Reg["tools.Registry<br/>schema 校验 → before 钩子 → Policy → 执行 → after 钩子"]
     Reg --> WS["tools.Workspace<br/>路径边界 · 受保护文件 · sha256 快照"]
@@ -35,7 +35,7 @@ flowchart LR
 | 模块 | 职责 |
 | --- | --- |
 | `runtime.py` | 执行循环、预算与超时、重试、工具批次、只读委派、最终状态与验证判定 |
-| `models.py` | 模型接口协议与 Chat Completions 适配，错误分类、`Retry-After`、响应清洗 |
+| `models.py` | Chat Completions 与 Anthropic Messages 适配、SSE 流式、错误分类与重试 |
 | `tools.py` | 工作区路径边界、权限策略、工具注册与参数校验、内置文件/搜索/测试/Git 工具 |
 | `context.py` | 系统提示、`AGENTS.md` 与 Skills 加载、超阈值时的历史回合压缩 |
 | `store.py` | SQLite 追加事件、产物分页、用量汇总、中断工具调用的补全 |
@@ -60,6 +60,22 @@ python -m codeharness run "给项目增加一个功能并验证" --workspace D:/
 默认逐次询问写入和测试执行权限。非交互环境需要显式传入 `--allow-write`、`--allow-exec`。
 `--isolate` 从干净 Git 仓库的 HEAD 创建独立 worktree，修改结果保留供检查。
 使用 `--no-delegate` 可以关闭探索子任务；使用 `--model-attempts` 调整单轮模型最大尝试次数（默认 3，含首次请求）。
+
+### 交互模式
+
+```powershell
+python -m codeharness chat --workspace D:/your/repo --env-file .env --confirm
+```
+
+`chat` 默认流式输出，并允许模型直接写文件和执行终端命令。请在可信工作区使用。`--confirm` 开启逐次确认，`--no-bash` 关闭模型的终端工具，`--no-stream` 等待整轮响应。`--tool-profile pi` 只向模型提供读取、新建、编辑和终端工具。`!命令` 由用户直接执行，使用宿主权限。
+
+`/compact` 压缩较早对话。`/tree` 查看回合，`/fork 2 备注` 从第 2 回合分叉，`/switch <ID>` 切换分支。分支共享当前工作目录，切换时请核对磁盘文件。
+
+启用 `--discover-extensions` 可加载可信的 `.codeharness/extensions/*.py`，也可以用 `--plugin` 指定文件。交互会话默认启用本地记忆，支持 `/pin`、`/memory` 和 `/remember`，可用 `--no-memory` 关闭。
+
+使用 Anthropic 原生协议时，设置 `ANTHROPIC_API_KEY`、`ANTHROPIC_MODEL`，并传入 `--provider anthropic`。自定义网关使用 `ANTHROPIC_BASE_URL`。交互中 `/model <模型名>` 沿用当前协议，`/model anthropic:<模型名>` 或 `/model openai:<模型名>` 可切换协议。新模型会收到已有会话上下文。
+
+### 会话记录
 
 ```powershell
 python -m codeharness sessions --workspace D:/your/repo
@@ -101,7 +117,6 @@ Git 工作区中的未跟踪忽略文件不参与列表、搜索或 `changed_fil
 
 片段正文按空格、`-`、`+` 前缀书写。有原文时可省略行号，声明的行数允许偏差。原文有多处匹配时，行号只能选出唯一最近的一处，等距或缺少行号会被拒绝。纯插入及统一 diff 新建文件需提供旧文件起始行号。工具先校验全部片段，再逐文件替换。`run`、`resume` 和 `benchmark` 可用 `--disable-tool apply_patch` 禁用它。
 扩展是可信本地 Python 代码，拥有宿主权限；只读子任务不加载自定义扩展。
-当前不提供任意 Shell、并行写入或第三方插件兼容性。
 
 模型适配器实现 `complete(messages, tools, max_tokens, *, timeout=None) -> Reply`；`timeout` 为调用剩余时间上限。Chat Completions 适配器在对端返回字符串型 `reasoning_content` 时保留该字段供后续调用，具体供应商兼容性需真实联调。会话 trace 可能包含私有代码、需求或模型返回内容，勿公开整个数据库。
 
@@ -169,7 +184,7 @@ python -m codeharness.benchmark --mode model --task discount --model-pool .codeh
 
 | 评测项 | 模型 / 范围 | 结果与关键指标 |
 | --- | --- | --- |
-| 单元测试与契约回归 | 离线全量 | 131/133 通过（2 跳过：符号链接权限与默认关闭的规模测试） |
+| 单元测试与契约回归 | 离线全量 | 152/154 通过（2 跳过：符号链接权限与默认关闭的规模测试） |
 | 参考夹具独立验收 | `full` 12 + `multi` 3 + `large` 4 | 19/19 全部通过（0 次模型调用） |
 | `glm-5.3`（`low`, 4096） | `core` / `multi` | `core` 4/5（`invoice` 澄清后 1/1）；`multi` 3/3（22 请求、62,579 Token、0 错误） |
 | S13 同模型对照（百炼） | `deepseek-v4.1-flash` / `flash-1017` | `core` 10/10 → 10/10；`multi` 6/6 → 3/6；开放委派未触发自发调用 |

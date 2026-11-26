@@ -115,6 +115,13 @@ class Agent:
     def commands(self) -> dict:
         return dict(self._ensure_extensions().commands)
 
+    def copy_session_pins(self, source_sid: str, new_sid: str):
+        self._ensure_extensions()
+        memory = self.memory_backend or self._owned_memory
+        if self.enable_memory and memory is not None:
+            for pin in memory.list_pins(source_sid):
+                memory.pin(new_sid, pin["content"])
+
     def _registry(self, sid: str, context: Context, readonly: bool, deadline: float) -> Registry:
         policy = Policy(readonly=True) if readonly else self.policy
         registry = Registry(self.workspace, policy)

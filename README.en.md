@@ -10,7 +10,7 @@ An extensible, inspectable coding-agent runtime written in Python. Python 3.11+,
 
 ```mermaid
 flowchart LR
-    CLI["cli.py<br/>run / resume / demo / sessions / trace"] --> Agent
+    CLI["cli.py<br/>chat / run / resume / demo / sessions / trace"] --> Agent
     Bench["benchmark.py<br/>fixtures / model evaluation"] --> Agent
     Bench --> Accept["Independent acceptance scripts<br/>outside the agent workspace"]
 
@@ -23,7 +23,7 @@ flowchart LR
         Check --> Budget
     end
 
-    Call --> Model["models.ChatModel<br/>Chat Completions compatible"]
+    Call --> Model["models.py<br/>Chat Completions / Anthropic Messages"]
     Prepare --> Ctx["context.Context<br/>AGENTS.md · Skills · compaction"]
     Batch --> Reg["tools.Registry<br/>schema check → before hooks → Policy → execute → after hooks"]
     Reg --> WS["tools.Workspace<br/>path boundary · protected files · sha256 snapshots"]
@@ -35,7 +35,7 @@ flowchart LR
 | Module | Responsibility |
 | --- | --- |
 | `runtime.py` | Execution loop, budgets and timeouts, retries, tool batches, read-only delegation, final status and verification |
-| `models.py` | Model protocol and Chat Completions adapter: error classification, `Retry-After`, response sanitising |
+| `models.py` | Chat Completions and Anthropic Messages adapters, SSE streaming, error classification and retries |
 | `tools.py` | Workspace path boundary, permission policy, tool registry and argument validation, built-in file/search/test/Git tools |
 | `context.py` | System prompt, `AGENTS.md` and Skills loading, compaction of older turns above a threshold |
 | `store.py` | SQLite append-only events, paged artifacts, usage totals, reconciliation of interrupted tool calls |
@@ -77,6 +77,20 @@ python -m codeharness trace SESSION_ID --workspace D:/your/repo --timeline
 15:23:54  result         status=budget_exhausted verification=not_run
 ```
 
+### Interactive sessions
+
+```powershell
+python -m codeharness chat --workspace D:/your/repo --env-file .env --confirm
+```
+
+`chat` streams by default and gives the model permission to edit files and run shell commands. Use it in a trusted workspace. `--confirm` prompts before model writes and execution, `--no-bash` disables the model's shell tool, and `--no-stream` waits for the whole reply. `--tool-profile pi` exposes only the read, create, edit, and shell tools. A `!command` runs directly with the user's local permissions.
+
+Use `/compact` to condense older context, `/tree` to inspect turns, `/fork 2 label` to branch from turn 2, and `/switch <ID>` to switch branches. Branches share the current filesystem, so check the files after switching.
+
+Use `--discover-extensions` to load trusted `.codeharness/extensions/*.py` files, or specify a file with `--plugin`. Interactive mode enables local memory with `/pin`, `/memory`, and `/remember`. Use `--no-memory` to disable it.
+
+For Anthropic Messages, set `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` and pass `--provider anthropic`. Set `ANTHROPIC_BASE_URL` for a custom gateway. `/model <name>` keeps the current protocol. `/model anthropic:<name>` and `/model openai:<name>` switch protocols. The new model receives the existing conversation context.
+
 ## How it works
 
 - The main task and read-only workers share one execution loop and one request/token budget; a worker has its own context and at most 6 requests.
@@ -95,7 +109,6 @@ Token budgets are estimated before a request and corrected from `usage` afterwar
 Each model attempt and test run uses the task's remaining time, capped at 60 seconds each; Git queries are capped at 15 seconds. Timeouts are checked at call boundaries and cannot guarantee immediate termination of every host process.
 Tests run on the local machine; path checks, permissions and Git worktrees are not an OS sandbox.
 Extensions are trusted local Python code with host privileges; read-only workers never load custom extensions.
-There is currently no arbitrary shell, no parallel writes and no third-party plugin compatibility.
 
 A model adapter implements `complete(messages, tools, max_tokens, *, timeout=None) -> Reply`, where `timeout` caps the remaining call time. The Chat Completions adapter keeps a string `reasoning_content` returned by the peer for later calls; provider compatibility must be confirmed by real integration. Session traces may contain private code, requirements or model output — never publish the whole database.
 
@@ -171,7 +184,7 @@ Benchmark pairs run on one model. Quota exhaustion preserves the tokens already 
 
 | Item | Result | Notes |
 | --- | --- | --- |
-| Unit and contract tests | 131/133 passed (2 skipped) | Symlink permissions and the opt-in scale test account for the local skips |
+| Unit and contract tests | 152/154 passed (2 skipped) | Symlink permissions and the opt-in scale test account for the local skips |
 | Reference fixture acceptance | 19/19 passed | `full` 12, `multi` 3, `large` 4. Every initial version fails its assertions and every reference fix passes (0 model calls) |
 | `glm-5.3` (`core`, `low`, 4096) | 4/5 (original prompt); `invoice` 1/1 after clarification | 33 requests, 65,570 tokens, 65.82 s, 0 model errors; acceptance exposed a negative-rounding difference under the original prompt |
 | `glm-5.3` (`multi`, `low`, 4096) | 3/3 passed | All three 11-file backend tasks fixed across exactly 3 modules; 22 requests, 62,579 tokens, 53.41 s, 0 model errors; `write_file` misuse errors dropped from 3 to 0 |
