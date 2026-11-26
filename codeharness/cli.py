@@ -138,6 +138,7 @@ def parser() -> argparse.ArgumentParser:
     execution.add_argument("--enable-bash", action="store_true", help="启用工作区 bash 终端命令工具（需要执行权限）")
     execution.add_argument("--tool-profile", choices=["default", "pi"], default="default",
                            help="工具集模式：default 为完整受控工具集，pi 为精简 4 工具模式")
+    execution.add_argument("--enable-memory", action="store_true", help="启用 L1/L2/L3 三层会话记忆扩展")
     execution.add_argument("--plugin", type=Path, action="append", default=[], help="加载可信 Python 扩展（本机权限）")
     run = commands.add_parser("run", parents=[common, execution], help="开始一个仓库任务")
     run.add_argument("task")
@@ -151,6 +152,8 @@ def parser() -> argparse.ArgumentParser:
     chat.add_argument("--session", dest="session_id", help="继续已有会话 ID")
     chat.add_argument("--no-bash", action="store_true", help="在交互模式中禁用 bash 工具")
     chat.add_argument("--no-stream", action="store_true", help="关闭流式输出，等待整轮完整返回")
+    chat.add_argument("--no-memory", action="store_true", help="在交互模式中禁用三层记忆扩展")
+    chat.add_argument("--discover-extensions", action="store_true", help="加载工作区中信任的 .codeharness/extensions/*.py")
     chat.add_argument("--confirm", action="store_true", help="开启写文件与执行命令前的交互确认")
     demo = commands.add_parser("demo", parents=[common], help="离线演示完整调用链；不调用真实模型")
     demo.add_argument("--directory", type=Path, help="演示目录，必须尚不存在")
@@ -237,6 +240,9 @@ def run_chat(agent: Agent, workspace: Path, store: Store, policy: Policy, *,
         if line == "/help":
             emit("命令：/help 帮助 | /tools 工具 | /session 会话 | /compact [重点] 压缩 | "
                  "!命令 | /exit 退出")
+            ext_cmds = agent.commands()
+            if ext_cmds:
+                emit("扩展命令：" + " | ".join(f"/{cmd.name} {cmd.description}" for cmd in ext_cmds.values()))
             continue
         if line == "/tools":
             emit(f"工具模式：{agent.tool_profile}（bash={'开' if agent.enable_bash else '关'}）")
@@ -265,6 +271,13 @@ def run_chat(agent: Agent, workspace: Path, store: Store, policy: Policy, *,
         if line.startswith("/"):
             parts = line[1:].split(None, 1)
             cmd_name = parts[0].lower() if parts else ""
+            cmd_args = parts[1] if len(parts) == 2 else ""
+            ext_cmd = agent.commands().get(cmd_name)
+            if ext_cmd is not None:
+                reply_text = ext_cmd.handler(cmd_args, {"session_id": sid, "workspace": workspace, "agent": agent})
+                if reply_text:
+                    emit(str(reply_text))
+                continue
             emit(f"未知命令：/{cmd_name}。输入 /help 查看可用命令。")
             continue
         if line.startswith("!"):
@@ -406,8 +419,12 @@ def main(argv: list[str] | None = None) -> int:
             agent = Agent(model, workspace, store, policy, limits, plugins,
                           enable_delegate=not getattr(args, "no_delegate", False),
                           disabled_tools=getattr(args, "disable_tool", ()),
-                          enable_bash=enable_bash, tool_profile=tool_profile)
-            return run_chat(agent, workspace, store, policy, session_id=sid, stream=not args.no_stream)
+                          enable_bash=enable_bash, tool_profile=tool_profile,
+                          enable_memory=not args.no_memory, discover_extensions=args.discover_extensions)
+            try:
+                return run_chat(agent, workspace, store, policy, session_id=sid, stream=not args.no_stream)
+            finally:
+                agent.close()
 
         def observe(kind, data):
             if args.json:
@@ -422,8 +439,12 @@ def main(argv: list[str] | None = None) -> int:
         agent = Agent(model, workspace, store, policy, limits, plugins, observe,
                       enable_delegate=not getattr(args, "no_delegate", False),
                       disabled_tools=getattr(args, "disable_tool", ()),
-                      enable_bash=enable_bash, tool_profile=tool_profile)
-        result = agent.run(task, session_id=sid)
+                      enable_bash=enable_bash, tool_profile=tool_profile,
+                      enable_memory=getattr(args, "enable_memory", False))
+        try:
+            result = agent.run(task, session_id=sid)
+        finally:
+            agent.close()
         output = {**asdict(result), "workspace": str(workspace), "store": str(store.path)}
         if args.json:
             print(json.dumps(output, ensure_ascii=False, indent=2))

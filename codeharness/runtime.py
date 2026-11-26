@@ -3,7 +3,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from hashlib import sha256
-import importlib.util
 import json
 from pathlib import Path
 import subprocess
@@ -11,6 +10,8 @@ import time
 from typing import Callable
 
 from .context import Context
+from .extensions import ExtensionHost
+from .memory import register_memory_extension
 from .models import Model, ModelError, Reply
 from .store import Store
 from .tokens import Calibrator, estimate_json
@@ -68,7 +69,8 @@ class Agent:
     def __init__(self, model: Model, workspace: Path, store: Store, policy: Policy | None = None,
                  limits: Limits | None = None, plugins: list[Path] | None = None,
                  observe: Callable | None = None, enable_delegate: bool = True, *, disabled_tools=(),
-                 enable_bash: bool = False, tool_profile: str = "default", on_delta: Callable | None = None):
+                 enable_bash: bool = False, tool_profile: str = "default", on_delta: Callable | None = None,
+                 enable_memory: bool = False, discover_extensions: bool = False, memory_backend=None):
         if tool_profile not in {"default", "pi"}:
             raise ValueError("tool_profile 必须是 default 或 pi")
         self.model = model
@@ -83,7 +85,35 @@ class Agent:
         self.enable_bash = enable_bash
         self.tool_profile = tool_profile
         self.on_delta = on_delta
+        self.enable_memory = enable_memory
+        self.discover_extensions = discover_extensions
+        self.memory_backend = memory_backend
+        self._extensions: ExtensionHost | None = None
+        self._owned_memory = None
         self._model_access_error = None
+
+    def _ensure_extensions(self) -> ExtensionHost:
+        if self._extensions is not None:
+            return self._extensions
+        host = ExtensionHost(self.workspace.root, self.store)
+        if self.enable_memory:
+            mem = register_memory_extension(host.api(), backend=self.memory_backend)
+            if self.memory_backend is None:
+                self._owned_memory = mem
+        if self.discover_extensions:
+            host.discover(self.workspace.root)
+        for path in self.plugins:
+            host.load_file(path)
+        self._extensions = host
+        return host
+
+    def close(self):
+        if self._owned_memory is not None:
+            self._owned_memory.close()
+            self._owned_memory = None
+
+    def commands(self) -> dict:
+        return dict(self._ensure_extensions().commands)
 
     def _registry(self, sid: str, context: Context, readonly: bool, deadline: float) -> Registry:
         policy = Policy(readonly=True) if readonly else self.policy
@@ -126,14 +156,7 @@ class Agent:
                                        "子任务有独立上下文，共享总预算，最多 6 次模型请求。", parameters({
                     "task": string("仅委派一个调查目标，要求返回活跃文件路径、函数或测试证据及简要结论")}, ["task"]),
                     delegate, "delegate"))
-            if self.tool_profile != "pi":
-                for index, path in enumerate(self.plugins):
-                    spec = importlib.util.spec_from_file_location(f"codeharness_extension_{index}", path)
-                    if not spec or not spec.loader:
-                        raise ValueError(f"无法加载扩展：{path}")
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
-                    module.register(registry)
+            self._ensure_extensions().apply_to_registry(registry, include_tools=self.tool_profile != "pi")
         for name in self.disabled_tools:
             registry.tools.pop(name, None)
         return registry
@@ -148,12 +171,15 @@ class Agent:
         self._sync_messages(state)
         before_count = len(state.messages)
         before_chars = len(json.dumps(state.messages, ensure_ascii=False))
-        compacted, changed = context.compact_now(state.messages, note=note)
+        extra_notes = [str(item) for item in self._ensure_extensions().emit(
+            "before_compact", {"session_id": sid, "note": note, "manual": True}) if item]
+        combined_note = "\n".join([part for part in [note.strip(), *extra_notes] if part])
+        compacted, changed = context.compact_now(state.messages, note=combined_note)
         if not changed:
             return {"compacted": False, "before_messages": before_count, "after_messages": before_count,
                     "before_chars": before_chars, "after_chars": before_chars}
         after_chars = len(json.dumps(compacted, ensure_ascii=False))
-        self.store.append(sid, "compact_checkpoint", {"messages": compacted, "note": note})
+        self.store.append(sid, "compact_checkpoint", {"messages": compacted, "note": combined_note})
         self.store.append(sid, "context_compacted", {"original_messages": before_count,
             "sent_messages": len(compacted), "strategy": "manual_compact"})
         return {"compacted": True, "before_messages": before_count, "after_messages": len(compacted),
@@ -174,6 +200,9 @@ class Agent:
             self._restore_detectors(state)
         try:
             registry = self._registry(sid, context, readonly, deadline)
+            if not readonly:
+                self._ensure_extensions().emit("session_start", {
+                    "session_id": sid, "workspace": self.workspace.root, "resumed": bool(session_id)})
             while (reply := self._next_request(state, registry, context)) is not None:
                 calls = reply.message.get("tool_calls", [])
                 if not calls:
@@ -187,7 +216,13 @@ class Agent:
             state.answer = "任务已中断，运行记录已保存。恢复前会检查未完成工具调用。"
         except Exception as exc:
             state.status, state.answer = "error", str(exc)
-        return self._finalize(state, baseline)
+        result = self._finalize(state, baseline)
+        if not readonly and self._extensions is not None:
+            try:
+                self._extensions.emit("session_end", {"session_id": sid, "task": task, "result": result})
+            except Exception:
+                pass
+        return result
 
     def _open_session(self, task: str, session_id: str | None, parent_id: str | None,
                       readonly: bool, context: Context) -> tuple[str, bool, dict]:
@@ -331,7 +366,16 @@ class Agent:
                 messages = list(messages)
                 messages[0] = dict(messages[0])
                 messages[0]["content"] += "\n\n已加载 Skills：\n" + "\n".join(state.legacy_skills.values())
-            prepared, compacted = context.prepare(messages)
+            before_compact = None
+            if not state.readonly and self._extensions is not None and self._extensions.handlers["before_compact"]:
+                before_compact = lambda: self._extensions.emit(
+                    "before_compact", {"session_id": sid, "note": "", "manual": False})
+            prepared, compacted = context.prepare(messages, before_compact=before_compact)
+            if not state.readonly and self._extensions is not None:
+                for item in self._extensions.emit("before_context", {"session_id": sid, "messages": prepared}):
+                    if isinstance(item, dict) and isinstance(item.get("message"), dict):
+                        pos = max(1, min(len(prepared), int(item.get("insert_at", len(prepared)))))
+                        prepared.insert(pos, dict(item["message"]))
             schemas = registry.schemas()
             raw_estimate = estimate_json([prepared, schemas])
             estimated_input = state.calibrator.adjust(raw_estimate)

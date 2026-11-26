@@ -68,9 +68,11 @@ class Context:
             raise ValueError("Skill 超过 16000 字符，请缩短后再加载")
         return {"name": name, "instructions": text}
 
-    def prepare(self, messages: list[dict]) -> tuple[list[dict], bool]:
+    def prepare(self, messages: list[dict], *, before_compact=None) -> tuple[list[dict], bool]:
         if len(json.dumps(messages, ensure_ascii=False)) <= self.max_chars:
             return copy.deepcopy(messages), False
+        if before_compact is not None:
+            before_compact()
         # Advance the boundary in groups of four and always keep the last two turns.
         starts = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
         compacted_turns = max(0, len(starts) - 2) // 4 * 4
