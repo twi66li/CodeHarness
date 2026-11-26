@@ -1,4 +1,5 @@
 import argparse
+from copy import deepcopy
 from dataclasses import asdict
 import json
 import os
@@ -12,7 +13,7 @@ from .model_pool import ModelPool
 from .models import ChatModel
 from .runtime import Agent, Limits
 from .store import Store
-from .tools import Policy
+from .tools import Policy, shell_command, test_subprocess_env
 
 
 def load_env(path: Path | None) -> dict[str, str]:
@@ -134,6 +135,9 @@ def parser() -> argparse.ArgumentParser:
     execution.add_argument("--model-attempts", type=int, default=3, help="每轮模型最多尝试次数（含首次，重试计入总预算）")
     execution.add_argument("--no-delegate", action="store_true", help="禁用只读任务委派，便于消融分析")
     execution.add_argument("--disable-tool", action="append", default=[], metavar="NAME", help="禁用一个工具，可重复")
+    execution.add_argument("--enable-bash", action="store_true", help="启用工作区 bash 终端命令工具（需要执行权限）")
+    execution.add_argument("--tool-profile", choices=["default", "pi"], default="default",
+                           help="工具集模式：default 为完整受控工具集，pi 为精简 4 工具模式")
     execution.add_argument("--plugin", type=Path, action="append", default=[], help="加载可信 Python 扩展（本机权限）")
     run = commands.add_parser("run", parents=[common, execution], help="开始一个仓库任务")
     run.add_argument("task")
@@ -141,6 +145,13 @@ def parser() -> argparse.ArgumentParser:
     resume = commands.add_parser("resume", parents=[common, execution], help="恢复会话并检查工作区变化")
     resume.add_argument("session_id")
     resume.add_argument("--message", default="继续原任务；先检查中断状态和当前工作区。")
+    # Argparse shares inherited Action objects, including their mutable defaults.
+    chat = commands.add_parser("chat", parents=[common, deepcopy(execution)], help="本地交互开发模式（默认流式输出与 bash，免逐次确认）")
+    chat.set_defaults(max_requests=200, max_tokens=500000, max_seconds=1800)
+    chat.add_argument("--session", dest="session_id", help="继续已有会话 ID")
+    chat.add_argument("--no-bash", action="store_true", help="在交互模式中禁用 bash 工具")
+    chat.add_argument("--no-stream", action="store_true", help="关闭流式输出，等待整轮完整返回")
+    chat.add_argument("--confirm", action="store_true", help="开启写文件与执行命令前的交互确认")
     demo = commands.add_parser("demo", parents=[common], help="离线演示完整调用链；不调用真实模型")
     demo.add_argument("--directory", type=Path, help="演示目录，必须尚不存在")
     commands.add_parser("sessions", parents=[common], help="列出主任务和子任务")
@@ -148,6 +159,147 @@ def parser() -> argparse.ArgumentParser:
     trace.add_argument("session_id")
     trace.add_argument("--timeline", action="store_true", help="仅显示请求、工具、压缩、验证和结果的时间线")
     return root
+
+
+def _tool_preview(name: str, arguments) -> str:
+    if not isinstance(arguments, dict):
+        return ""
+    if name == "bash" and isinstance(arguments.get("command"), str):
+        cmd = arguments["command"].strip().replace("\n", " ")
+        return cmd[:100] + ("..." if len(cmd) > 100 else "")
+    for key in ("path", "query", "name", "task", "artifact_id"):
+        if isinstance(arguments.get(key), str) and arguments[key]:
+            return arguments[key][:80]
+    return ""
+
+
+def run_chat(agent: Agent, workspace: Path, store: Store, policy: Policy, *,
+             session_id: str | None = None, stream: bool = True,
+             input_fn=input, output=None) -> int:
+    out = output or sys.stdout
+    sid = session_id
+    state = {"mode": None, "printed": False}
+
+    def emit(text: str = "", *, end: str = "\n"):
+        print(text, end=end, file=out, flush=True)
+
+    def end_stream_line():
+        if state["mode"] is not None:
+            emit("")
+            state["mode"] = None
+
+    def on_delta(kind: str, chunk: str):
+        if kind == "reasoning":
+            if state["mode"] != "reasoning":
+                end_stream_line()
+                emit("[思考] ", end="")
+                state["mode"] = "reasoning"
+            emit(chunk, end="")
+        elif kind == "text":
+            if state["mode"] == "reasoning":
+                emit("")
+            state["mode"] = "text"
+            state["printed"] = True
+            emit(chunk, end="")
+
+    def observe(kind: str, data: dict):
+        if kind == "tool":
+            end_stream_line()
+            preview = _tool_preview(data["name"], data.get("arguments"))
+            detail = f" {preview}" if preview else ""
+            emit(f"[工具] {data['name']}{detail}")
+        elif kind == "model_switch":
+            end_stream_line()
+            emit(f"[切换模型] {data['previous']} → {data['model']}")
+
+    agent.observe = observe
+    agent.on_delta = on_delta if stream else None
+
+    emit(f"CodeHarness 交互模式 | 工作区：{workspace} | 模型：{agent.model.name}")
+    emit(f"工具模式：{agent.tool_profile} | bash：{'开' if agent.enable_bash else '关'} | 输入 /help 查看命令，/exit 退出")
+    if sid:
+        emit(f"继续会话：{sid}")
+
+    while True:
+        try:
+            raw = input_fn("\n> ")
+        except EOFError:
+            emit("")
+            break
+        except KeyboardInterrupt:
+            emit("\n已取消输入。输入 /exit 退出。")
+            continue
+        line = raw.strip()
+        if not line:
+            continue
+        if line in {"/exit", "/quit"}:
+            break
+        if line == "/help":
+            emit("命令：/help 帮助 | /tools 工具 | /session 会话 | /compact [重点] 压缩 | "
+                 "!命令 | /exit 退出")
+            continue
+        if line == "/tools":
+            emit(f"工具模式：{agent.tool_profile}（bash={'开' if agent.enable_bash else '关'}）")
+            emit("已启用：" + ", ".join(agent.tool_names()))
+            continue
+        if line == "/session":
+            if not sid:
+                emit(f"尚未开始会话 | 工作区：{workspace} | 模型：{agent.model.name}")
+            else:
+                usage = store.usage(sid)
+                emit(f"会话：{sid} | 工作区：{workspace} | 模型：{agent.model.name}")
+                emit("用量：" + json.dumps(usage, ensure_ascii=False))
+            continue
+        if line == "/compact" or line.startswith("/compact "):
+            if not sid:
+                emit("尚未开始会话，无需压缩。")
+                continue
+            note = line[len("/compact"):].strip()
+            info = agent.compact(sid, note=note)
+            if info["compacted"]:
+                emit(f"已压缩：{info['before_messages']} → {info['after_messages']} 条消息，"
+                     f"{info['before_chars']} → {info['after_chars']} 字符")
+            else:
+                emit(f"当前仅 {info['before_messages']} 条消息，暂无需压缩。")
+            continue
+        if line.startswith("/"):
+            parts = line[1:].split(None, 1)
+            cmd_name = parts[0].lower() if parts else ""
+            emit(f"未知命令：/{cmd_name}。输入 /help 查看可用命令。")
+            continue
+        if line.startswith("!"):
+            command = line[1:].strip()
+            if not command:
+                continue
+            try:
+                proc = subprocess.run(shell_command(command), cwd=workspace,
+                                      env=test_subprocess_env(policy.pass_env),
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      text=True, encoding="utf-8", errors="replace", timeout=60)
+                if proc.stdout:
+                    emit(proc.stdout.rstrip("\n"))
+                emit(f"[本地命令退出码：{proc.returncode}]")
+            except subprocess.TimeoutExpired:
+                emit("[本地命令超时：60 秒]")
+            except KeyboardInterrupt:
+                emit("\n[已中断本地命令]")
+            continue
+
+        state["mode"] = None
+        state["printed"] = False
+        result = agent.run(line, session_id=sid)
+        sid = result.session_id
+        end_stream_line()
+        if not state["printed"] or result.status in {"error", "cancelled", "timeout", "stalled"}:
+            emit(result.answer)
+        changes = ", ".join(result.changed_files) or "无"
+        usage = result.usage
+        emit(f"[{result.status} | 改动：{changes} | 请求：{usage['requests']} | "
+             f"tokens：in={usage['input_tokens']} out={usage['output_tokens']}]")
+
+    if sid:
+        emit(f"会话已保存：{sid}（可用 codeharness chat --session {sid} 继续）")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -192,15 +344,19 @@ def main(argv: list[str] | None = None) -> int:
             plugins = []
             task = "修复购物篮百分比折扣计算，并运行现有测试验证。"
             sid = None
+            enable_bash = False
+            tool_profile = "default"
             if not args.json:
                 print("离线演示：使用确定性适配器，不调用 AI，不产生真实模型评测成绩。")
         else:
             env = {**load_env(args.env_file), **os.environ}
             model_name = args.model or env.get("CODEHARNESS_MODEL") or env.get("OPENAI_MODEL")
-            sid = args.session_id if args.command == "resume" else None
+            sid = getattr(args, "session_id", None) if args.command in {"resume", "chat"} else None
             if sid:
                 store = Store(database.resolve())
                 row = store.session(sid)
+                if args.command == "chat" and row["parent_id"] is not None:
+                    raise ValueError("不能用交互模式恢复只读子任务")
                 workspace = Path(row["workspace"])
                 model_name = model_name or row["model"]
             limits = Limits(args.max_requests, args.max_tokens, args.output_tokens, args.context_chars, args.max_seconds,
@@ -225,17 +381,33 @@ def main(argv: list[str] | None = None) -> int:
             def confirm(name, arguments):
                 if not sys.stdin.isatty():
                     return False
-                target = arguments.get("path", "当前工作区")
+                target = arguments.get("command") if name == "bash" else arguments.get("path", "当前工作区")
                 return input(f"允许 {name} 操作 {target}？输入 yes 确认：").strip().lower() == "yes"
             for name in args.pass_env:
                 if name.upper().endswith(("_KEY", "_TOKEN", "_SECRET", "_PASSWORD")):
                     print(f"警告：测试代码可读取显式放行的环境变量 {name}。", file=sys.stderr)
-            policy = Policy(args.allow_write, args.allow_exec, confirm=confirm, pass_env=tuple(args.pass_env))
+            if args.command == "chat":
+                allow_write = True if not args.confirm else args.allow_write
+                allow_exec = True if not args.confirm else args.allow_exec
+                policy = Policy(allow_write, allow_exec, confirm=confirm if args.confirm else None,
+                                pass_env=tuple(args.pass_env))
+                enable_bash = not args.no_bash
+            else:
+                policy = Policy(args.allow_write, args.allow_exec, confirm=confirm, pass_env=tuple(args.pass_env))
+                enable_bash = args.enable_bash or args.tool_profile == "pi"
+            tool_profile = args.tool_profile
             plugins = args.plugin
-            task = args.message if sid else args.task
+            task = args.message if args.command == "resume" else getattr(args, "task", "")
 
         if store is None:
             store = Store(database.resolve())
+
+        if args.command == "chat":
+            agent = Agent(model, workspace, store, policy, limits, plugins,
+                          enable_delegate=not getattr(args, "no_delegate", False),
+                          disabled_tools=getattr(args, "disable_tool", ()),
+                          enable_bash=enable_bash, tool_profile=tool_profile)
+            return run_chat(agent, workspace, store, policy, session_id=sid, stream=not args.no_stream)
 
         def observe(kind, data):
             if args.json:
@@ -247,9 +419,11 @@ def main(argv: list[str] | None = None) -> int:
             elif kind == "model_switch":
                 print(f"切换模型：{data['previous']} → {data['model']}", flush=True)
 
-        result = Agent(model, workspace, store, policy, limits, plugins, observe,
-                       enable_delegate=not getattr(args, "no_delegate", False),
-                       disabled_tools=getattr(args, "disable_tool", ())).run(task, session_id=sid)
+        agent = Agent(model, workspace, store, policy, limits, plugins, observe,
+                      enable_delegate=not getattr(args, "no_delegate", False),
+                      disabled_tools=getattr(args, "disable_tool", ()),
+                      enable_bash=enable_bash, tool_profile=tool_profile)
+        result = agent.run(task, session_id=sid)
         output = {**asdict(result), "workspace": str(workspace), "store": str(store.path)}
         if args.json:
             print(json.dumps(output, ensure_ascii=False, indent=2))

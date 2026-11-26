@@ -67,7 +67,10 @@ class LoopState:
 class Agent:
     def __init__(self, model: Model, workspace: Path, store: Store, policy: Policy | None = None,
                  limits: Limits | None = None, plugins: list[Path] | None = None,
-                 observe: Callable | None = None, enable_delegate: bool = True, *, disabled_tools=()):
+                 observe: Callable | None = None, enable_delegate: bool = True, *, disabled_tools=(),
+                 enable_bash: bool = False, tool_profile: str = "default", on_delta: Callable | None = None):
+        if tool_profile not in {"default", "pi"}:
+            raise ValueError("tool_profile 必须是 default 或 pi")
         self.model = model
         self.workspace = Workspace(workspace)
         self.store = store
@@ -77,16 +80,20 @@ class Agent:
         self.observe = observe or (lambda kind, data: None)
         self.enable_delegate = enable_delegate
         self.disabled_tools = frozenset(disabled_tools)
+        self.enable_bash = enable_bash
+        self.tool_profile = tool_profile
+        self.on_delta = on_delta
         self._model_access_error = None
 
     def _registry(self, sid: str, context: Context, readonly: bool, deadline: float) -> Registry:
         policy = Policy(readonly=True) if readonly else self.policy
         registry = Registry(self.workspace, policy)
-        register_workspace_tools(registry, deadline=deadline)
+        register_workspace_tools(registry, deadline=deadline, enable_bash=self.enable_bash,
+                                 tool_profile=self.tool_profile)
         if readonly:
             registry.tools = {name: tool for name, tool in registry.tools.items() if tool.effect == "read"}
 
-        if context.skills:
+        if context.skills and self.tool_profile != "pi":
             def load_skill(name):
                 result = context.load_skill(name)
                 self.store.append(sid, "skill_loaded", {**result, "delivery": "message"})
@@ -102,12 +109,13 @@ class Agent:
             return {"artifact_id": artifact_id, "offset": offset,
                     "content": text[offset:offset + chars], "total_chars": len(text)}
 
-        registry.register(Tool("read_artifact", "分页读取本任务已保存的完整工具输出。", parameters({
-            "artifact_id": string("工具结果中的产物 ID"), "offset": integer("字符偏移，默认 0"),
-            "chars": integer("读取字符数，默认 4000，上限 6000")}, ["artifact_id"]), read_artifact))
+        if self.tool_profile != "pi":
+            registry.register(Tool("read_artifact", "分页读取本任务已保存的完整工具输出。", parameters({
+                "artifact_id": string("工具结果中的产物 ID"), "offset": integer("字符偏移，默认 0"),
+                "chars": integer("读取字符数，默认 4000，上限 6000")}, ["artifact_id"]), read_artifact))
 
         if not readonly:
-            if self.enable_delegate:
+            if self.enable_delegate and self.tool_profile != "pi":
                 def delegate(task):
                     child = self.run(task, parent_id=sid, readonly=True, deadline=deadline)
                     return {"session_id": child.session_id, "status": child.status,
@@ -118,16 +126,38 @@ class Agent:
                                        "子任务有独立上下文，共享总预算，最多 6 次模型请求。", parameters({
                     "task": string("仅委派一个调查目标，要求返回活跃文件路径、函数或测试证据及简要结论")}, ["task"]),
                     delegate, "delegate"))
-            for index, path in enumerate(self.plugins):
-                spec = importlib.util.spec_from_file_location(f"codeharness_extension_{index}", path)
-                if not spec or not spec.loader:
-                    raise ValueError(f"无法加载扩展：{path}")
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                module.register(registry)
+            if self.tool_profile != "pi":
+                for index, path in enumerate(self.plugins):
+                    spec = importlib.util.spec_from_file_location(f"codeharness_extension_{index}", path)
+                    if not spec or not spec.loader:
+                        raise ValueError(f"无法加载扩展：{path}")
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    module.register(registry)
         for name in self.disabled_tools:
             registry.tools.pop(name, None)
         return registry
+
+    def tool_names(self) -> list[str]:
+        context = Context(self.workspace.root, self.limits.context_chars)
+        return list(self._registry("preview", context, False, time.monotonic() + 60).tools)
+
+    def compact(self, sid: str, note: str = "") -> dict:
+        context = Context(self.workspace.root, self.limits.context_chars)
+        state = LoopState(sid, False, time.monotonic() + 60)
+        self._sync_messages(state)
+        before_count = len(state.messages)
+        before_chars = len(json.dumps(state.messages, ensure_ascii=False))
+        compacted, changed = context.compact_now(state.messages, note=note)
+        if not changed:
+            return {"compacted": False, "before_messages": before_count, "after_messages": before_count,
+                    "before_chars": before_chars, "after_chars": before_chars}
+        after_chars = len(json.dumps(compacted, ensure_ascii=False))
+        self.store.append(sid, "compact_checkpoint", {"messages": compacted, "note": note})
+        self.store.append(sid, "context_compacted", {"original_messages": before_count,
+            "sent_messages": len(compacted), "strategy": "manual_compact"})
+        return {"compacted": True, "before_messages": before_count, "after_messages": len(compacted),
+                "before_chars": before_chars, "after_chars": after_chars}
 
     def run(self, task: str, session_id: str | None = None, parent_id: str | None = None,
             readonly: bool = False, deadline: float | None = None) -> Result:
@@ -181,7 +211,8 @@ class Agent:
             self.store.append(sid, "message", {"role": "user", "content": task})
         else:
             sid = self.store.create(self.workspace.root, self.model.name, parent_id)
-            self.store.append(sid, "message", {"role": "system", "content": context.system(readonly)})
+            self.store.append(sid, "message", {"role": "system", "content": context.system(
+                readonly, tool_profile=self.tool_profile, enable_bash=self.enable_bash)})
             self.store.append(sid, "message", {"role": "user", "content": task})
             self._save_snapshot(sid, "baseline", snapshot)
         self.store.status(sid, "running")
@@ -261,7 +292,9 @@ class Agent:
             events = self.store.events(state.sid, after=state.event_cursor, expand=False)
         for event in events:
             data = event["data"]
-            if event["kind"] == "message":
+            if event["kind"] == "compact_checkpoint":
+                state.messages = [dict(message) for message in data["messages"]]
+            elif event["kind"] == "message":
                 state.messages.append(data)
             elif event["kind"] == "skill_injected":
                 state.messages.append(data["message"])
@@ -333,7 +366,11 @@ class Agent:
                 "remaining_seconds": seconds_left})
             state.local_requests += 1
             try:
-                reply = self.model.complete(prepared, schemas, output_tokens, timeout=seconds_left)
+                if self.on_delta is not None and not state.readonly and getattr(self.model, "supports_stream", False):
+                    reply = self.model.complete(prepared, schemas, output_tokens,
+                                                timeout=seconds_left, on_delta=self.on_delta)
+                else:
+                    reply = self.model.complete(prepared, schemas, output_tokens, timeout=seconds_left)
             except ModelError as exc:
                 if exc.truncated:
                     if exc.usage is not None:
@@ -449,9 +486,14 @@ class Agent:
     def _start_call(self, sid: str, registry: Registry, call: dict):
         name = call["function"]["name"]
         tool = registry.tools.get(name)
+        raw_args = call["function"].get("arguments")
+        try:
+            parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except ValueError:
+            parsed_args = None
         self.store.append(sid, "tool_started", {"call_id": call["id"], "name": name,
             "effect": tool.effect if tool is not None else None})
-        self.observe("tool", {"session_id": sid, "name": name})
+        self.observe("tool", {"session_id": sid, "name": name, "arguments": parsed_args})
 
     @staticmethod
     def _tool_failure(exc: Exception) -> dict:

@@ -137,14 +137,23 @@ class ModelPool:
         self.name = name
         self.prepared_input = estimated_input
 
+    @property
+    def supports_stream(self) -> bool:
+        adapter = self.adapters.get(self.name)
+        return bool(getattr(adapter, "supports_stream", False))
+
     def complete(self, messages: list[dict], tools: list[dict], max_tokens: int,
-                 *, timeout: float | None = None) -> Reply:
+                 *, timeout: float | None = None, on_delta=None) -> Reply:
         estimated_input = self.prepared_input
         self.prepared_input = None
         if estimated_input is None:
             estimated_input = estimate_json([messages, tools])
         try:
-            reply = self.adapters[self.name].complete(messages, tools, max_tokens, timeout=timeout)
+            adapter = self.adapters[self.name]
+            if on_delta is not None and getattr(adapter, "supports_stream", False):
+                reply = adapter.complete(messages, tools, max_tokens, timeout=timeout, on_delta=on_delta)
+            else:
+                reply = adapter.complete(messages, tools, max_tokens, timeout=timeout)
         except ModelError as exc:
             input_tokens, output_tokens = (estimated_input, max_tokens) if exc.consume_output_budget else (0, 0)
             self.record(self.name, *(exc.usage or (input_tokens, output_tokens)), estimated=exc.usage is None)

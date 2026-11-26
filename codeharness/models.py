@@ -80,6 +80,8 @@ class Model(Protocol):
 class ChatModel:
     """OpenAI-compatible Chat Completions. Credentials never enter the trace."""
 
+    supports_stream = True
+
     def __init__(self, model: str, base_url: str, api_key: str, timeout: float = 60,
                  *, reasoning_effort: str | None = None):
         parsed = urlsplit(base_url)
@@ -93,14 +95,123 @@ class ChatModel:
         self.timeout = timeout
         self.reasoning_effort = reasoning_effort
 
+    def _parse_reply(self, message: dict, finish_reason: str | None, usage: dict,
+                     messages: list[dict], tools: list[dict]) -> Reply:
+        if finish_reason == "length":
+            counts = None
+            try:
+                input_use, output_use = int(usage["prompt_tokens"]), int(usage["completion_tokens"])
+                if min(input_use, output_use) >= 0:
+                    counts = (input_use, output_use)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+            raise ModelError("模型输出达到单次上限，未接受不完整的回答或工具调用",
+                             truncated=True, usage=counts)
+        clean = {"role": "assistant", "content": message.get("content") or ""}
+        if not isinstance(clean["content"], str):
+            raise ValueError("invalid content")
+        if isinstance(message.get("reasoning_content"), str):
+            clean["reasoning_content"] = message["reasoning_content"]
+        calls = message.get("tool_calls") or []
+        if calls:
+            seen = set()
+            cleaned_calls = []
+            for call in calls:
+                if (call["type"] != "function" or not isinstance(call["id"], str)
+                        or not call["id"] or call["id"] in seen):
+                    raise ValueError("invalid tool call")
+                seen.add(call["id"])
+                fn = call["function"]
+                if not isinstance(fn["arguments"], str) or not isinstance(fn["name"], str) or not fn["name"]:
+                    raise ValueError("invalid arguments")
+                cleaned_calls.append({
+                    "id": call["id"],
+                    "type": "function",
+                    "function": {"name": fn["name"], "arguments": fn["arguments"]},
+                })
+            clean["tool_calls"] = cleaned_calls
+        estimated = "prompt_tokens" not in usage or "completion_tokens" not in usage
+        input_tokens = int(usage["prompt_tokens"]) if "prompt_tokens" in usage else estimate_json([messages, tools])
+        output_tokens = int(usage["completion_tokens"]) if "completion_tokens" in usage else estimate_json(clean)
+        if min(input_tokens, output_tokens) < 0:
+            raise ValueError("invalid usage")
+        details = usage.get("prompt_tokens_details")
+        cached_tokens = details.get("cached_tokens", 0) if isinstance(details, dict) else 0
+        if type(cached_tokens) is not int or cached_tokens < 0:
+            cached_tokens = 0
+        return Reply(clean, input_tokens, output_tokens, estimated, cached_tokens)
+
+    def _read_stream(self, response, on_delta) -> tuple[dict, str | None, dict]:
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        calls_by_index: dict[int, dict] = {}
+        finish_reason: str | None = None
+        usage: dict = {}
+        saw_chunk = False
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or line.startswith(":") or not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            chunk = json.loads(payload)
+            if not isinstance(chunk, dict):
+                raise ValueError("invalid stream chunk")
+            saw_chunk = True
+            if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
+                usage = chunk["usage"]
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            if choice.get("finish_reason") is not None:
+                finish_reason = choice["finish_reason"]
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                raise ValueError("invalid delta")
+            reasoning = delta.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                reasoning_parts.append(reasoning)
+                on_delta("reasoning", reasoning)
+            text = delta.get("content")
+            if isinstance(text, str) and text:
+                content_parts.append(text)
+                on_delta("text", text)
+            for item in delta.get("tool_calls") or []:
+                idx = item.get("index", len(calls_by_index))
+                entry = calls_by_index.setdefault(idx, {
+                    "id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                if isinstance(item.get("id"), str) and item["id"]:
+                    entry["id"] = item["id"]
+                if isinstance(item.get("type"), str) and item["type"]:
+                    entry["type"] = item["type"]
+                fn = item.get("function")
+                if isinstance(fn, dict):
+                    if isinstance(fn.get("name"), str) and fn["name"]:
+                        entry["function"]["name"] += fn["name"]
+                    if isinstance(fn.get("arguments"), str) and fn["arguments"]:
+                        entry["function"]["arguments"] += fn["arguments"]
+        if not saw_chunk or finish_reason is None:
+            raise ModelError("模型流提前结束，未接受不完整的回答或工具调用", retryable=True)
+        message: dict = {"role": "assistant", "content": "".join(content_parts)}
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
+        if calls_by_index:
+            message["tool_calls"] = [calls_by_index[i] for i in sorted(calls_by_index)]
+        return message, finish_reason, usage
+
     def complete(self, messages: list[dict], tools: list[dict], max_tokens: int,
-                 *, timeout: float | None = None) -> Reply:
+                 *, timeout: float | None = None, on_delta=None) -> Reply:
         payload = {"model": self.name, "messages": messages, "max_tokens": max_tokens}
         if self.reasoning_effort is not None:
             payload["reasoning_effort"] = self.reasoning_effort
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if on_delta is not None:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
         request = Request(
             self.url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -108,7 +219,10 @@ class ChatModel:
         )
         try:
             with urlopen(request, timeout=min(self.timeout, timeout) if timeout is not None else self.timeout) as response:
-                data = json.load(response)
+                if on_delta is not None:
+                    message, finish_reason, usage = self._read_stream(response, on_delta)
+                else:
+                    data = json.load(response)
         except HTTPError as exc:
             # Provider bodies and URLs can contain credentials; only extract a safe ASCII error tag.
             try:
@@ -130,51 +244,13 @@ class ChatModel:
         except (ValueError, UnicodeError):
             raise ModelError("模型接口返回了无效 JSON") from None
         try:
-            choice = data["choices"][0]
-            usage = data.get("usage") or {}
-            if choice.get("finish_reason") == "length":
-                counts = None
-                try:
-                    input_use, output_use = int(usage["prompt_tokens"]), int(usage["completion_tokens"])
-                    if min(input_use, output_use) >= 0:
-                        counts = (input_use, output_use)
-                except (KeyError, TypeError, ValueError, OverflowError):
-                    pass
-                raise ModelError("模型输出达到单次上限，未接受不完整的回答或工具调用",
-                                 truncated=True, usage=counts)
-            message = choice["message"]
-            clean = {"role": "assistant", "content": message.get("content") or ""}
-            if not isinstance(clean["content"], str):
-                raise ValueError("invalid content")
-            if isinstance(message.get("reasoning_content"), str):
-                clean["reasoning_content"] = message["reasoning_content"]
-            calls = message.get("tool_calls") or []
-            if calls:
-                seen = set()
-                cleaned_calls = []
-                for call in calls:
-                    if (call["type"] != "function" or not isinstance(call["id"], str)
-                            or not call["id"] or call["id"] in seen):
-                        raise ValueError("invalid tool call")
-                    seen.add(call["id"])
-                    fn = call["function"]
-                    if not isinstance(fn["arguments"], str) or not isinstance(fn["name"], str) or not fn["name"]:
-                        raise ValueError("invalid arguments")
-                    cleaned_calls.append({
-                        "id": call["id"],
-                        "type": "function",
-                        "function": {"name": fn["name"], "arguments": fn["arguments"]},
-                    })
-                clean["tool_calls"] = cleaned_calls
-            estimated = "prompt_tokens" not in usage or "completion_tokens" not in usage
-            input_tokens = int(usage["prompt_tokens"]) if "prompt_tokens" in usage else estimate_json([messages, tools])
-            output_tokens = int(usage["completion_tokens"]) if "completion_tokens" in usage else estimate_json(clean)
-            if min(input_tokens, output_tokens) < 0:
-                raise ValueError("invalid usage")
-            details = usage.get("prompt_tokens_details")
-            cached_tokens = details.get("cached_tokens", 0) if isinstance(details, dict) else 0
-            if type(cached_tokens) is not int or cached_tokens < 0:
-                cached_tokens = 0
-            return Reply(clean, input_tokens, output_tokens, estimated, cached_tokens)
+            if on_delta is None:
+                choice = data["choices"][0]
+                message = choice["message"]
+                finish_reason = choice.get("finish_reason")
+                usage = data.get("usage") or {}
+            return self._parse_reply(message, finish_reason, usage, messages, tools)
+        except ModelError:
+            raise
         except (KeyError, IndexError, TypeError, ValueError):
             raise ModelError("模型响应缺少有效的 message、tool_calls 或 usage") from None

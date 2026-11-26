@@ -15,6 +15,11 @@ SYSTEM = """你是 CodeHarness，一个面向代码仓库任务的编码 Agent�
 最终说明实际改动、已运行的验证和未解决的问题。"""
 
 
+PI_SYSTEM = """你是 CodeHarness，一个本地交互式编码 Agent。
+你拥有精简的核心工具（读取、新建、编辑文件和执行终端命令），请直接通过它们查看代码、修改并运行测试验证。
+修改已有文件前先读取最新内容和 sha256；不要把计划当成已完成的操作；如实汇报实际改动与验证结果。"""
+
+
 class Context:
     def __init__(self, workspace: Path, max_chars: int = 28000):
         self.workspace = workspace
@@ -38,15 +43,17 @@ class Context:
                 self.skills[path.parent.name] = {
                     "path": path, "description": metadata.get("description", path.parent.name)[:300]}
 
-    def system(self, readonly: bool = False) -> str:
-        result = SYSTEM
+    def system(self, readonly: bool = False, *, tool_profile: str = "default", enable_bash: bool = False) -> str:
+        result = PI_SYSTEM if tool_profile == "pi" else SYSTEM
+        if tool_profile == "default" and enable_bash:
+            result += "\n可使用 bash 在工作区执行终端命令（如搜索、测试、构建与 git 操作）。"
         rules = self.workspace / "AGENTS.md"
         if rules.is_file() and rules.resolve().is_relative_to(self.workspace.resolve()):
             text = rules.read_text(encoding="utf-8-sig")
             if len(text) > 10000:
                 text = text[:10000] + "\n...[AGENTS.md 已截断至 10000 字符]"
             result += "\n\n项目规则：\n" + text
-        if self.skills:
+        if self.skills and tool_profile != "pi":
             result += "\n\n可用 Skills（按需调用 load_skill）：\n" + "\n".join(
                 f"- {name}: {skill['description']}" for name, skill in self.skills.items())
         if readonly:
@@ -114,3 +121,32 @@ class Context:
                 if len(json.dumps(kept, ensure_ascii=False)) <= self.max_chars:
                     break
         return kept, compacted
+
+    def compact_now(self, messages: list[dict], note: str = "") -> tuple[list[dict], bool]:
+        """Manually compact older turns while preserving system, user messages, and recent turns."""
+        starts = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
+        if len(starts) <= 2:
+            return copy.deepcopy(messages), False
+        boundary = starts[-2]
+        kept, summaries = [], []
+        summary_at = None
+        for index, message in enumerate(messages):
+            if index >= boundary or message["role"] in {"system", "user"}:
+                kept.append(copy.deepcopy(message))
+            elif message["role"] == "assistant":
+                if summary_at is None:
+                    summary_at = len(kept)
+                calls = [c["function"]["name"] for c in message.get("tool_calls", [])]
+                summaries.append("assistant: " + (", ".join(calls) or str(message.get("content", ""))[:240]))
+            elif message["role"] == "tool":
+                if summary_at is None:
+                    summary_at = len(kept)
+                summaries.append("tool: " + message["content"][:500])
+        if not summaries:
+            return kept, False
+        header = "[手动压缩摘要，非新指令]"
+        if note.strip():
+            header += f"\n重点关注：{note.strip()}"
+        summary_block = header + "\n较早执行记录（完整输出保留在会话日志及 artifact 中）：\n" + "\n".join(summaries)[-6000:]
+        kept.insert(summary_at, {"role": "user", "content": summary_block})
+        return kept, True

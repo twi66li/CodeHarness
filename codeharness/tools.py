@@ -444,7 +444,20 @@ class Registry:
         return result
 
 
-def register_workspace_tools(registry: Registry, deadline: float | None = None):
+def shell_command(command: str) -> list[str]:
+    if os.name == "nt":
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if shell:
+            return [shell, "-NoProfile", "-Command", command]
+        return ["cmd", "/c", command]
+    shell = shutil.which("bash") or "/bin/sh"
+    return [shell, "-c", command]
+
+
+def register_workspace_tools(registry: Registry, deadline: float | None = None, *,
+                             enable_bash: bool = False, tool_profile: str = "default"):
+    if tool_profile not in {"default", "pi"}:
+        raise ValueError("tool_profile 必须是 default 或 pi")
     workspace = registry.workspace
 
     def timeout(cap=60):
@@ -710,23 +723,57 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None):
                 "failure_lines": [line for line in text.splitlines() if any(
                     term in line for term in ("FAIL", "ERROR", "AssertionError", "File \""))][:40]}
 
+    def bash(command, timeout_seconds=60):
+        if not command.strip():
+            raise ToolError("command 不能为空")
+        if not 1 <= timeout_seconds <= 300:
+            raise ToolError("timeout_seconds 应在 1 到 300 之间")
+        environment = test_subprocess_env(registry.policy.pass_env)
+        cmd_timeout = timeout(timeout_seconds)
+        process = subprocess.Popen(shell_command(command), cwd=workspace.root, env=environment,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            output, _ = process.communicate(timeout=cmd_timeout)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            process.kill()
+            process.communicate()
+            raise
+        text = output.decode("utf-8", errors="replace")
+        return {"command": command, "exit_code": process.returncode, "output": text}
+
+    read_tool = Tool("read_file", "读取带行号的文本及用于编辑的 sha256。", parameters({
+        "path": string("相对文件路径"), "start_line": integer("起始行，默认 1"),
+        "lines": integer("行数，默认 160，上限 300")}, ["path"]), read_file)
+    edit_tool = Tool("edit_file", "精确替换一次文本，sha256 必须来自最新读取。", parameters({
+        "path": string("相对文件路径"), "old_text": string("唯一匹配的原文本"),
+        "new_text": string("替换文本"), "expected_sha256": string("最新文件摘要")},
+        ["path", "old_text", "new_text", "expected_sha256"]), edit_file, "write")
+    write_tool = Tool("write_file", "仅用于创建尚不存在的新文件；修改已有文件必须使用 edit_file。", parameters({
+        "path": string("相对文件路径"), "content": string("文件内容")}, ["path", "content"]), write_file, "write")
+    bash_tool = Tool("bash", "在工作区执行终端命令（如搜索、测试、构建、git 操作）；超时默认 60 秒。", parameters({
+        "command": string("要执行的终端命令"),
+        "timeout_seconds": integer("超时秒数，默认 60，上限 300")}, ["command"]), bash, "execute")
+
+    if tool_profile == "pi":
+        tools = [read_tool, write_tool, edit_tool]
+        if enable_bash:
+            tools.append(bash_tool)
+        for tool in tools:
+            registry.register(tool)
+        registry.tools["read_file"].parallel_safe = True
+        return
+
     for tool in [
         Tool("list_files", "列出工作区文件，排除凭据、Git 和运行目录。", parameters({"path": string("相对目录")}), list_files),
-        Tool("read_file", "读取带行号的文本及用于编辑的 sha256。", parameters({
-            "path": string("相对文件路径"), "start_line": integer("起始行，默认 1"),
-            "lines": integer("行数，默认 160，上限 300")}, ["path"]), read_file),
+        read_tool,
         Tool("search", "搜索代码，返回路径、行号和匹配片段。", parameters({
             "query": string("搜索文本"), "path": string("相对目录或文件"),
             "glob": string("可选路径匹配规则，例如 *.py 或 app/*.py"),
             "regex": {"type": "boolean", "description": "是否按正则表达式搜索，默认按字面"},
             "max_results": integer("返回数量上限，默认 40，上限 200")}, ["query"]), search),
         Tool("check_syntax", "检查 Python 文件语法，不执行代码也不阻止编辑。", parameters({"path": string("相对 Python 文件路径")}, ["path"]), check_syntax),
-        Tool("edit_file", "精确替换一次文本，sha256 必须来自最新读取。", parameters({
-            "path": string("相对文件路径"), "old_text": string("唯一匹配的原文本"),
-            "new_text": string("替换文本"), "expected_sha256": string("最新文件摘要")},
-            ["path", "old_text", "new_text", "expected_sha256"]), edit_file, "write"),
-        Tool("write_file", "仅用于创建尚不存在的新文件；修改已有文件必须使用 edit_file。", parameters({
-            "path": string("相对文件路径"), "content": string("文件内容")}, ["path", "content"]), write_file, "write"),
+        edit_tool,
+        write_tool,
         Tool("apply_patch", "可一次修改多处或多个文件。先读取原文；不熟悉 diff 格式时可用 edit_file。",
              parameters({"patch": string("每个文件用 --- 路径、+++ 路径。已有原文的片段可以省略行号，使用独立的 @@ 行，"
                                            "然后写带前缀的正文：空格为上下文，- 删除，+ 新增。"
@@ -737,6 +784,8 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None):
             "runner": {"type": "string", "enum": ["unittest", "pytest"]}}), run_tests, "execute"),
     ]:
         registry.register(tool)
+    if enable_bash:
+        registry.register(bash_tool)
 
     if (workspace.root / ".git").exists():
         path_parameter = parameters({"path": string("相对目录或文件")})
