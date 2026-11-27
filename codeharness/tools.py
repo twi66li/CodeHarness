@@ -14,6 +14,8 @@ import tempfile
 import time
 from typing import Callable
 
+from .sandbox import ExecResult, Executor
+
 
 class ToolError(RuntimeError):
     pass
@@ -454,11 +456,41 @@ def shell_command(command: str) -> list[str]:
     return [shell, "-c", command]
 
 
+class LocalExecutor:
+    """Default host subprocess executor."""
+
+    mode = "local"
+
+    def python_executable(self) -> str:
+        return sys.executable
+
+    def format_path(self, target: Path, workspace_root: Path) -> str:
+        return str(target)
+
+    def run_argv(self, argv: list[str], cwd: Path, env: dict[str, str], timeout: float,
+                 *, pass_env: tuple[str, ...] = ()) -> ExecResult:
+        process = subprocess.Popen(argv, cwd=cwd, env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            output, _ = process.communicate(timeout=timeout)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            process.kill()
+            process.communicate()
+            raise
+        return ExecResult(process.returncode, output.decode("utf-8", errors="replace"))
+
+    def run_shell(self, command: str, cwd: Path, env: dict[str, str], timeout: float,
+                  *, pass_env: tuple[str, ...] = ()) -> ExecResult:
+        return self.run_argv(shell_command(command), cwd, env, timeout, pass_env=pass_env)
+
+
 def register_workspace_tools(registry: Registry, deadline: float | None = None, *,
-                             enable_bash: bool = False, tool_profile: str = "default"):
+                             enable_bash: bool = False, tool_profile: str = "default",
+                             executor: Executor | None = None):
     if tool_profile not in {"default", "pi"}:
         raise ValueError("tool_profile 必须是 default 或 pi")
     workspace = registry.workspace
+    runner_exec = executor or LocalExecutor()
 
     def timeout(cap=60):
         remaining = min(cap, deadline - time.monotonic()) if deadline is not None else cap
@@ -694,32 +726,34 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None, 
 
     def run_tests(path="tests", runner="unittest"):
         target = workspace.path(path)
+        python_exe = runner_exec.python_executable()
         if runner == "unittest":
             if target.is_dir():
-                command = [sys.executable, "-m", "unittest", "discover", "-s", str(target), "-v"]
+                target_arg = runner_exec.format_path(target, workspace.root)
+                command = [python_exe, "-m", "unittest", "discover", "-s", target_arg, "-v"]
             elif target.is_file() and target.suffix == ".py":
-                command = [sys.executable, "-m", "unittest", "discover", "-s", str(target.parent),
+                parent_arg = runner_exec.format_path(target.parent, workspace.root)
+                command = [python_exe, "-m", "unittest", "discover", "-s", parent_arg,
                            "-p", target.name, "-v"]
             else:
                 raise ToolError("unittest 的 path 必须是测试目录或 Python 测试文件")
         else:
-            command = [sys.executable, "-m", "pytest", str(target), "-q", "-p", "no:cacheprovider"]
+            target_arg = runner_exec.format_path(target, workspace.root)
+            command = [python_exe, "-m", "pytest", target_arg, "-q", "-p", "no:cacheprovider"]
         environment = test_subprocess_env(registry.policy.pass_env)
         test_timeout = timeout()
-        process = subprocess.Popen(command, cwd=workspace.root, env=environment,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
-            output, _ = process.communicate(timeout=test_timeout)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt):
-            process.kill()
-            process.communicate()
-            raise
-        text = output.decode("utf-8", errors="replace")
+            outcome = runner_exec.run_argv(command, workspace.root, environment, test_timeout,
+                                           pass_env=registry.policy.pass_env)
+        except RuntimeError as exc:
+            raise ToolError(str(exc)) from None
+        text = outcome.output
         collected = re.search(r"Ran (\d+) tests?", text) if runner == "unittest" else None
         no_tests = runner == "unittest" and (collected is None or int(collected.group(1)) == 0)
         # Missing pytest is an environment failure, not evidence of a code defect.
-        return {"command": command[1:], "exit_code": process.returncode,
-                "passed": process.returncode == 0 and not no_tests, "output": text,
+        return {"command": command[1:], "exit_code": outcome.exit_code,
+                "passed": outcome.exit_code == 0 and not no_tests, "output": text,
+                "sandbox": runner_exec.mode,
                 "failure_lines": [line for line in text.splitlines() if any(
                     term in line for term in ("FAIL", "ERROR", "AssertionError", "File \""))][:40]}
 
@@ -730,16 +764,13 @@ def register_workspace_tools(registry: Registry, deadline: float | None = None, 
             raise ToolError("timeout_seconds 应在 1 到 300 之间")
         environment = test_subprocess_env(registry.policy.pass_env)
         cmd_timeout = timeout(timeout_seconds)
-        process = subprocess.Popen(shell_command(command), cwd=workspace.root, env=environment,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
-            output, _ = process.communicate(timeout=cmd_timeout)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt):
-            process.kill()
-            process.communicate()
-            raise
-        text = output.decode("utf-8", errors="replace")
-        return {"command": command, "exit_code": process.returncode, "output": text}
+            outcome = runner_exec.run_shell(command, workspace.root, environment, cmd_timeout,
+                                            pass_env=registry.policy.pass_env)
+        except RuntimeError as exc:
+            raise ToolError(str(exc)) from None
+        return {"command": command, "exit_code": outcome.exit_code, "output": outcome.output,
+                "sandbox": runner_exec.mode}
 
     read_tool = Tool("read_file", "读取带行号的文本及用于编辑的 sha256。", parameters({
         "path": string("相对文件路径"), "start_line": integer("起始行，默认 1"),

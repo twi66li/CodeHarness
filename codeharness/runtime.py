@@ -13,6 +13,7 @@ from .context import Context
 from .extensions import ExtensionHost
 from .memory import register_memory_extension
 from .models import Model, ModelError, Reply
+from .sandbox import Executor
 from .store import Store
 from .tokens import Calibrator, estimate_json
 from .tools import Policy, Registry, Tool, ToolError, Workspace, integer, parameters, register_workspace_tools, string
@@ -52,6 +53,7 @@ class LoopState:
     sid: str
     readonly: bool
     deadline: float
+    turn: int = 0
     local_requests: int = 0
     failed_attempts: int = 0
     truncations: int = 0
@@ -70,7 +72,8 @@ class Agent:
                  limits: Limits | None = None, plugins: list[Path] | None = None,
                  observe: Callable | None = None, enable_delegate: bool = True, *, disabled_tools=(),
                  enable_bash: bool = False, tool_profile: str = "default", on_delta: Callable | None = None,
-                 enable_memory: bool = False, discover_extensions: bool = False, memory_backend=None):
+                 enable_memory: bool = False, discover_extensions: bool = False, memory_backend=None,
+                 executor: Executor | None = None):
         if tool_profile not in {"default", "pi"}:
             raise ValueError("tool_profile 必须是 default 或 pi")
         self.model = model
@@ -88,6 +91,7 @@ class Agent:
         self.enable_memory = enable_memory
         self.discover_extensions = discover_extensions
         self.memory_backend = memory_backend
+        self.executor = executor
         self._extensions: ExtensionHost | None = None
         self._owned_memory = None
         self._model_access_error = None
@@ -126,7 +130,7 @@ class Agent:
         policy = Policy(readonly=True) if readonly else self.policy
         registry = Registry(self.workspace, policy)
         register_workspace_tools(registry, deadline=deadline, enable_bash=self.enable_bash,
-                                 tool_profile=self.tool_profile)
+                                 tool_profile=self.tool_profile, executor=self.executor)
         if readonly:
             registry.tools = {name: tool for name, tool in registry.tools.items() if tool.effect == "read"}
 
@@ -298,6 +302,7 @@ class Agent:
             data = event["data"]
             if event["kind"] == "model_request":
                 pending_estimate = data.get("raw_estimated_input")
+                state.turn = max(state.turn, int(data.get("turn", state.turn + 1)))
             elif event["kind"] == "usage" and pending_estimate is not None:
                 if not data.get("estimated"):
                     state.calibrator.observe(pending_estimate, data["input_tokens"])
@@ -360,6 +365,8 @@ class Agent:
         sid = state.sid
         retry_output_cap = min(2 * self.limits.output_tokens, 8192)
         output_cap = retry_output_cap if state.truncations == 1 else self.limits.output_tokens
+        turn = state.turn + 1
+        attempt = 0
         while True:
             if self._model_access_error:
                 state.status, state.answer = "error", self._model_access_error
@@ -401,7 +408,7 @@ class Agent:
                 try:
                     prepare_attempt(estimated_input, output_tokens)
                 except ModelError as exc:
-                    self.store.append(sid, "model_error", {"attempt": 0, "error": str(exc),
+                    self.store.append(sid, "model_error", {"turn": turn, "attempt": 0, "error": str(exc),
                         "retryable": exc.retryable, "access_denied": exc.access_denied,
                         "quota_exhausted": exc.quota_exhausted, "preflight": True})
                     raise
@@ -410,12 +417,15 @@ class Agent:
             seconds_left = state.deadline - time.monotonic()
             if self._timed_out(state, seconds_left=seconds_left):
                 return None
+            state.turn = turn
+            attempt += 1
             # Each physical model attempt counts towards the shared budget.
-            self.store.append(sid, "model_request", {"model": self.model.name,
+            self.store.append(sid, "model_request", {"turn": turn, "attempt": attempt, "model": self.model.name,
                 "messages": prepared, "tools": schemas, "max_tokens": output_tokens,
                 "estimated_input": estimated_input, "raw_estimated_input": raw_estimate,
                 "remaining_seconds": seconds_left})
             state.local_requests += 1
+            req_started = time.monotonic()
             try:
                 if self.on_delta is not None and not state.readonly and getattr(self.model, "supports_stream", False):
                     reply = self.model.complete(prepared, schemas, output_tokens,
@@ -423,32 +433,38 @@ class Agent:
                 else:
                     reply = self.model.complete(prepared, schemas, output_tokens, timeout=seconds_left)
             except ModelError as exc:
+                duration_ms = max(0, int(round((time.monotonic() - req_started) * 1000)))
                 if exc.truncated:
                     if exc.usage is not None:
                         state.calibrator.observe(raw_estimate, exc.usage[0])
-                    if not self._recover_truncation(state, exc, estimated_input, output_tokens):
+                    if not self._recover_truncation(state, exc, estimated_input, output_tokens, duration_ms):
                         return None
                     if state.truncations == 1:
                         output_cap = retry_output_cap
                     continue
-                if not self._retry(state, exc, estimated_input, output_tokens, min_output):
+                if not self._retry(state, exc, estimated_input, output_tokens, min_output, duration_ms):
                     return None
                 continue
+            duration_ms = max(0, int(round((time.monotonic() - req_started) * 1000)))
             state.failed_attempts = 0
             state.truncations = 0
             if not reply.estimated:
                 state.calibrator.observe(raw_estimate, reply.input_tokens)
-            self.store.append(sid, "usage", {"input_tokens": reply.input_tokens,
-                "output_tokens": reply.output_tokens, "estimated": reply.estimated, "cached_tokens": reply.cached_tokens})
+            self.store.append(sid, "usage", {"turn": turn, "input_tokens": reply.input_tokens,
+                "output_tokens": reply.output_tokens, "estimated": reply.estimated,
+                "cached_tokens": reply.cached_tokens, "duration_ms": duration_ms})
             self.store.append(sid, "message", reply.message)
             return None if self._timed_out(state) else reply
 
-    def _recover_truncation(self, state: LoopState, exc: ModelError, estimated_input: int, output_tokens: int) -> bool:
+    def _recover_truncation(self, state: LoopState, exc: ModelError, estimated_input: int,
+                            output_tokens: int, duration_ms: int = 0) -> bool:
         state.truncations += 1
         input_use, output_use = exc.usage or (estimated_input, output_tokens)
-        self.store.append(state.sid, "usage", {"input_tokens": input_use, "output_tokens": output_use,
-            "estimated": exc.usage is None, "failed_attempt": True})
-        self.store.append(state.sid, "model_truncated", {"attempt": state.truncations, "max_tokens": output_tokens})
+        self.store.append(state.sid, "usage", {"turn": state.turn, "input_tokens": input_use,
+            "output_tokens": output_use, "estimated": exc.usage is None, "failed_attempt": True,
+            "duration_ms": duration_ms})
+        self.store.append(state.sid, "model_truncated", {"turn": state.turn, "attempt": state.truncations,
+            "max_tokens": output_tokens, "duration_ms": duration_ms})
         if self._timed_out(state):
             return False
         if state.truncations > self.limits.truncation_retries:
@@ -459,16 +475,17 @@ class Agent:
         return True
 
     def _retry(self, state: LoopState, exc: ModelError, estimated_input: int, output_tokens: int,
-               min_output: int) -> bool:
+               min_output: int, duration_ms: int = 0) -> bool:
         sid = state.sid
         state.failed_attempts += 1
         if exc.access_denied:
             self._model_access_error = str(exc)
-        self.store.append(sid, "model_error", {"attempt": state.failed_attempts, "error": str(exc),
-            "retryable": exc.retryable, "access_denied": exc.access_denied, "quota_exhausted": exc.quota_exhausted})
+        self.store.append(sid, "model_error", {"turn": state.turn, "attempt": state.failed_attempts,
+            "error": str(exc), "retryable": exc.retryable, "access_denied": exc.access_denied,
+            "quota_exhausted": exc.quota_exhausted, "duration_ms": duration_ms})
         # Reserve output only when a provider may have generated tokens.
         input_use, output_use = (estimated_input, output_tokens) if exc.consume_output_budget else (0, 0)
-        self.store.append(sid, "usage", {"input_tokens": input_use, "output_tokens": output_use,
+        self.store.append(sid, "usage", {"turn": state.turn, "input_tokens": input_use, "output_tokens": output_use,
             "estimated": True, "failed_attempt": True})
         if self._timed_out(state):
             return False
@@ -482,7 +499,8 @@ class Agent:
         if self._timed_out(state, "剩余任务时间不足以等待模型重试。",
                            seconds_left=state.deadline - time.monotonic() - delay):
             return False
-        self.store.append(sid, "model_retry", {"next_attempt": state.failed_attempts + 1, "delay_seconds": delay})
+        self.store.append(sid, "model_retry", {"turn": state.turn, "next_attempt": state.failed_attempts + 1,
+            "delay_seconds": delay})
         time.sleep(delay)
         return True
 
@@ -499,7 +517,7 @@ class Agent:
             for call in calls:
                 if self._timed_out(state):
                     break
-                self._start_call(sid, registry, call)
+                self._start_call(state, registry, call)
                 scheduled.append(call)
             calls = scheduled
             with ThreadPoolExecutor(max_workers=4) as executor:
@@ -507,13 +525,13 @@ class Agent:
 
         for index, call in enumerate(calls):
             if parallel:
-                args, outcome = outcomes[index]
+                args, outcome, duration_ms = outcomes[index]
             else:
                 if self._timed_out(state):
                     return True
-                self._start_call(sid, registry, call)
-                args, outcome = self._invoke_call(registry, call)
-            signature, result = self._record_call(state, registry, call, args, outcome)
+                self._start_call(state, registry, call)
+                args, outcome, duration_ms = self._invoke_call(registry, call)
+            signature, result = self._record_call(state, registry, call, args, outcome, duration_ms)
             loaded_skill |= call["function"]["name"] == "load_skill" and result["ok"]
             if self._model_access_error:
                 state.status, state.answer = "error", self._model_access_error
@@ -534,7 +552,8 @@ class Agent:
             self._publish_skills(sid)
         return state.status in {"stalled", "timeout"}
 
-    def _start_call(self, sid: str, registry: Registry, call: dict):
+    def _start_call(self, state: LoopState, registry: Registry, call: dict):
+        sid = state.sid
         name = call["function"]["name"]
         tool = registry.tools.get(name)
         raw_args = call["function"].get("arguments")
@@ -542,7 +561,7 @@ class Agent:
             parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
         except ValueError:
             parsed_args = None
-        self.store.append(sid, "tool_started", {"call_id": call["id"], "name": name,
+        self.store.append(sid, "tool_started", {"turn": state.turn, "call_id": call["id"], "name": name,
             "effect": tool.effect if tool is not None else None})
         self.observe("tool", {"session_id": sid, "name": name, "arguments": parsed_args})
 
@@ -554,13 +573,17 @@ class Agent:
 
     def _invoke_call(self, registry: Registry, call: dict) -> tuple:
         args = call["function"]["arguments"]
+        started = time.monotonic()
         try:
             args = json.loads(args)
-            return args, {"ok": True, "output": registry.invoke(call["function"]["name"], args)}
+            outcome = {"ok": True, "output": registry.invoke(call["function"]["name"], args)}
         except Exception as exc:
-            return args, self._tool_failure(exc)
+            outcome = self._tool_failure(exc)
+        duration_ms = max(0, int(round((time.monotonic() - started) * 1000)))
+        return args, outcome, duration_ms
 
-    def _record_call(self, state: LoopState, registry: Registry, call: dict, args, outcome: dict) -> tuple:
+    def _record_call(self, state: LoopState, registry: Registry, call: dict, args, outcome: dict,
+                     duration_ms: int = 0) -> tuple:
         sid = state.sid
         name, cid = call["function"]["name"], call["id"]
         tool = registry.tools.get(name)
@@ -586,7 +609,8 @@ class Agent:
             run_tests_snapshot = self.workspace.snapshot(use_cache=False)
             self.store.append(sid, "verification", {"passed": False, "files": run_tests_snapshot, "artifact_id": None})
         signature = self._tool_signature(name, args, json.loads(full) if result["ok"] else result)
-        self.store.append(sid, "tool_finished", {"call_id": cid, "name": name, "result": result, "signature": signature})
+        self.store.append(sid, "tool_finished", {"turn": state.turn, "call_id": cid, "name": name,
+            "result": result, "signature": signature, "duration_ms": duration_ms})
         self.store.append(sid, "message", {"role": "tool", "tool_call_id": cid,
             "content": json.dumps(result, ensure_ascii=False)})
         if tool and tool.effect in {"write", "execute"}:

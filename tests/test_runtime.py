@@ -302,7 +302,9 @@ class RuntimeTests(unittest.TestCase):
         events = self.store.events(result.session_id)
         truncated = [e["data"] for e in events if e["kind"] == "model_truncated"]
         first_usage = next(e["data"] for e in events if e["kind"] == "usage")
-        self.assertEqual(truncated, [{"attempt": 1, "max_tokens": 2048}])
+        self.assertEqual(len(truncated), 1)
+        self.assertEqual((truncated[0]["turn"], truncated[0]["attempt"], truncated[0]["max_tokens"]), (1, 1, 2048))
+        self.assertIsInstance(truncated[0]["duration_ms"], int)
         self.assertEqual((first_usage["input_tokens"], first_usage["output_tokens"], first_usage["estimated"]),
                          (120, 40, False))
 

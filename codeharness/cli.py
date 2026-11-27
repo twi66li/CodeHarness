@@ -12,6 +12,7 @@ from .demo import DemoModel, create_demo
 from .model_pool import ModelPool
 from .models import AnthropicModel, ChatModel
 from .runtime import Agent, Limits
+from .sandbox import DockerExecutor
 from .store import Store
 from .tools import Policy, shell_command, test_subprocess_env
 
@@ -100,13 +101,14 @@ def isolated_workspace(workspace: Path) -> Path:
 
 def trace_timeline(events):
     fields = {
-        "model_request": ("model", "max_tokens"),
-        "model_error": ("attempt", "retryable", "quota_exhausted", "preflight"),
-        "model_retry": ("next_attempt", "delay_seconds"),
-        "model_truncated": ("attempt", "max_tokens"),
+        "model_request": ("turn", "attempt", "model", "max_tokens"),
+        "usage": ("turn", "input_tokens", "output_tokens", "cached_tokens", "duration_ms"),
+        "model_error": ("turn", "attempt", "retryable", "quota_exhausted", "preflight", "duration_ms"),
+        "model_retry": ("turn", "next_attempt", "delay_seconds"),
+        "model_truncated": ("turn", "attempt", "max_tokens", "duration_ms"),
         "context_compacted": ("original_messages", "sent_messages"),
-        "tool_started": ("name", "call_id"),
-        "tool_finished": ("name", "call_id"),
+        "tool_started": ("turn", "name", "call_id"),
+        "tool_finished": ("turn", "name", "call_id", "duration_ms"),
         "verification": ("passed",),
         "result": ("status", "verification"),
     }
@@ -153,6 +155,10 @@ def parser() -> argparse.ArgumentParser:
     execution.add_argument("--no-delegate", action="store_true", help="禁用只读任务委派，便于消融分析")
     execution.add_argument("--disable-tool", action="append", default=[], metavar="NAME", help="禁用一个工具，可重复")
     execution.add_argument("--enable-bash", action="store_true", help="启用工作区 bash 终端命令工具（需要执行权限）")
+    execution.add_argument("--sandbox", choices=["local", "docker"], default="local",
+                           help="测试与 bash 执行环境：local（本机进程）或 docker（断网限资源容器沙箱）")
+    execution.add_argument("--sandbox-image", default="python:3.12-slim",
+                           help="Docker 沙箱镜像，默认 python:3.12-slim")
     execution.add_argument("--tool-profile", choices=["default", "pi"], default="default",
                            help="工具集模式：default 为完整受控工具集，pi 为精简 4 工具模式")
     execution.add_argument("--enable-memory", action="store_true", help="启用 L1/L2/L3 三层会话记忆扩展")
@@ -236,7 +242,9 @@ def run_chat(agent: Agent, workspace: Path, store: Store, policy: Policy, *,
     agent.on_delta = on_delta if stream else None
 
     emit(f"CodeHarness 交互模式 | 工作区：{workspace} | 模型：{agent.model.name}")
-    emit(f"工具模式：{agent.tool_profile} | bash：{'开' if agent.enable_bash else '关'} | 输入 /help 查看命令，/exit 退出")
+    sandbox_label = (f"docker ({agent.executor.image})" if isinstance(agent.executor, DockerExecutor)
+                     else (agent.executor.mode if agent.executor else "local"))
+    emit(f"工具模式：{agent.tool_profile} | bash：{'开' if agent.enable_bash else '关'} | 沙箱：{sandbox_label} | 输入 /help 查看命令，/exit 退出")
     if sid:
         emit(f"继续会话：{sid}")
 
@@ -461,6 +469,7 @@ def main(argv: list[str] | None = None) -> int:
             sid = None
             enable_bash = False
             tool_profile = "default"
+            executor = None
             env = {}
             provider = "openai"
             if not args.json:
@@ -512,6 +521,7 @@ def main(argv: list[str] | None = None) -> int:
                 policy = Policy(args.allow_write, args.allow_exec, confirm=confirm, pass_env=tuple(args.pass_env))
                 enable_bash = args.enable_bash or args.tool_profile == "pi"
             tool_profile = args.tool_profile
+            executor = DockerExecutor(args.sandbox_image) if args.sandbox == "docker" else None
             plugins = args.plugin
             task = args.message if args.command == "resume" else getattr(args, "task", "")
 
@@ -539,7 +549,8 @@ def main(argv: list[str] | None = None) -> int:
                           enable_delegate=not getattr(args, "no_delegate", False),
                           disabled_tools=getattr(args, "disable_tool", ()),
                           enable_bash=enable_bash, tool_profile=tool_profile,
-                          enable_memory=not args.no_memory, discover_extensions=args.discover_extensions)
+                          enable_memory=not args.no_memory, discover_extensions=args.discover_extensions,
+                          executor=executor)
             try:
                 return run_chat(agent, workspace, store, policy, session_id=sid, stream=not args.no_stream,
                                 switch_model=switch_model)
@@ -560,7 +571,8 @@ def main(argv: list[str] | None = None) -> int:
                       enable_delegate=not getattr(args, "no_delegate", False),
                       disabled_tools=getattr(args, "disable_tool", ()),
                       enable_bash=enable_bash, tool_profile=tool_profile,
-                      enable_memory=getattr(args, "enable_memory", False))
+                      enable_memory=getattr(args, "enable_memory", False),
+                      executor=executor)
         try:
             result = agent.run(task, session_id=sid)
         finally:
