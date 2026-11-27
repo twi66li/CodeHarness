@@ -84,7 +84,7 @@ python -m codeharness trace SESSION_ID --workspace D:/your/repo --json
 python -m codeharness trace SESSION_ID --workspace D:/your/repo --timeline
 ```
 
-`--timeline` 按事件顺序显示模型请求、工具、压缩、委派、验证与结果，可与 `--json` 合用。以下为一次 `multi` 订单任务的 UTC 时间线节选，省略了小数秒和调用 ID。Agent 耗尽预算时还没运行工作区测试，外部独立验收已通过。
+`--timeline` 按事件顺序显示模型请求（`turn`/`attempt`）、用量与耗时（`duration_ms`）、工具、压缩、委派、验证与结果，可与 `--json` 合用。以下为一次 `multi` 订单任务的 UTC 时间线节选，省略了小数秒和调用 ID。Agent 耗尽预算时还没运行工作区测试，外部独立验收已通过。
 
 ```text
 15:23:33  model_request  model=deepseek-v4.1-flash max_tokens=4096
@@ -110,7 +110,7 @@ python -m codeharness trace SESSION_ID --workspace D:/your/repo --timeline
 Token 预算在请求前估算、返回后按 usage 校正；仅对可能已产生输出的失败尝试（如 5xx、超时、长度截断）按估计输入及输出上限保守预留并标记 estimated，429 限流或鉴权拒绝等明确未生成输出的失败不虚扣输出预算，但仍占用共享请求上限。不是供应商侧的硬计费限额。
 每次模型尝试及测试执行使用任务剩余时间，且分别最多 60 秒；Git 查询最多 15 秒。超时在调用边界检查，不能保证立即终止所有宿主进程。
 连续 5 次工具操作的参数和结果都相同时，会话以 `stalled` 结束，CLI 返回 2。会话记录保留此前的重复操作提示，可用 `trace` 查看。
-测试在本机执行；路径检查、权限和 Git worktree 不构成操作系统沙箱。
+默认测试与 `bash` 在本机进程执行（路径检查、权限和 Git worktree 不构成操作系统沙箱）；如需 OS 级隔离，可在 `run`、`resume` 或 `chat` 中传入 `--sandbox docker`（可选 `--sandbox-image python:3.12-slim`），将命令与测试放入断网（`--network none`）、只读根文件系统、限制内存/CPU/PID 且仅挂载工作区的临时容器执行，超时通过 `docker rm -f` 回收整棵进程树。
 测试工具和独立验收使用环境变量白名单。`run`、`resume` 可用 `--pass-env NAME` 显式传递进程变量，敏感名称会触发提示。常见私钥和凭据文件名会被工作区工具过滤。
 Git 工作区中的未跟踪忽略文件不参与列表、搜索或 `changed_files`。`search` 支持 `regex` 和 `max_results`，正则搜索在可用时使用 ripgrep。
 需要多处或多文件修改时，可使用 `apply_patch`。统一 diff 支持成对的 `---`、`+++` 文件头，也支持现有文件用 `---` 后直接接 `@@`。补丁末尾可用 `*** End Patch` 或 `--- End Patch`。OpenAI 风格补丁以 `*** Begin Patch` 开头，支持 `*** Update File:`、`*** Add File:` 和 `*** Delete File:`。
@@ -184,7 +184,7 @@ python -m codeharness.benchmark --mode model --task discount --model-pool .codeh
 
 | 评测项 | 模型 / 范围 | 结果与关键指标 |
 | --- | --- | --- |
-| 单元测试与契约回归 | 离线全量 | 152/154 通过（2 跳过：符号链接权限与默认关闭的规模测试） |
+| 单元测试与契约回归 | 离线全量 | 163/165 通过（2 跳过：符号链接权限与默认关闭的规模测试） |
 | 参考夹具独立验收 | `full` 12 + `multi` 3 + `large` 4 | 19/19 全部通过（0 次模型调用） |
 | `glm-5.3`（`low`, 4096） | `core` / `multi` | `core` 4/5（`invoice` 澄清后 1/1）；`multi` 3/3（22 请求、62,579 Token、0 错误） |
 | S13 同模型对照（百炼） | `deepseek-v4.1-flash` / `flash-1017` | `core` 10/10 → 10/10；`multi` 6/6 → 3/6；开放委派未触发自发调用 |

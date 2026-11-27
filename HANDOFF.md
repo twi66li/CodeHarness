@@ -2,6 +2,50 @@
 
 接手本仓库开发前，请按 [AGENTS.md](AGENTS.md) 核对 `git status --short --branch` 与 `git rev-parse HEAD`，以实际源码和实测为准。
 
+## 真实开源仓库评测套件｜2026-11-27 12 Fix + 8 Review
+
+```text
+任务：构建真实开源仓库 Issue/PR 评测套件（12 Fix + 8 Review）并完成离线黄金基线门禁与真实模型端到端实测；负责人：Antigravity
+基线：d05b3af3006834adc6ebd881071f18a1936aad88；工作区：D:\Code\python\CodeHarness；分支：main
+范围：codeharness/eval_oss.py、codeharness/eval_oss_tasks.json、tests/test_eval_oss.py（外部克隆仓库缓存在 .codeharness/oss_repos/，已忽略不入库；保留工作区中另一会话的 Docker 沙箱未提交改动不动）
+交付：未提交新增文件 3 个（待统一按职责提交）；状态：实现、离线门禁与真实模型端到端实测完成，待提交
+验证：
+  - 单元测试：.venv\Scripts\python.exe -B -m unittest tests.test_eval_oss -v -> 4/4 OK
+  - 离线黄金基线门禁（0 Token）：.venv\Scripts\python.exe -B -m codeharness.eval_oss validate -> Fix 12/12 合法（73 FAIL_TO_PASS + 6,797 PASS_TO_PASS）、Review 8/8 合法
+  - 真实模型端到端实测（本机 Magpie workbuddy/deepseek-v4.1-flash，共消耗 2,457,246 Token，在 28M 授权预算内）：
+    * Fix（12 题，隐藏 test_patch，enable_bash=True）：解决 10/12（83.3%），FAIL_TO_PASS 67/73（91.8%），PASS_TO_PASS 6,797/6,797（100.0%，零回归）
+    * Review（8 题，只读模式 + LLM-as-a-Judge）：输出 20 条 findings，TP=6、FP=14，命中 Ground Truth 2/8，Precision 30.0%、Recall 25.0%、F1 27.3%
+  - 证据报告：.codeharness/benchmarks/oss-eval-20261127-complete/report.json（分批原始报告：oss-full-20261127 与 oss-review-20261127-v3）
+未验证或阻塞：Review 首轮暴露出思考模型在 686 行大 diff 上易产假设性误报（8 条 FP），且有 3 题在收尾阶段因思考输出触发单次上限截断而未交出 JSON；后续可按需接入低推理强度或分文件审查专项优化
+下一步：按用户授权单独提交 eval_oss 三个文件（与 Docker 沙箱改动分开提交，保留本地 .gitignore 不动）
+```
+
+### 真实开源评测明细（`pytest-dev/pluggy`、`pypa/packaging`、`pallets/click`）
+
+- **Fix（12 题）**：`pluggy` 5/5 全过；`packaging` 2/3（`packaging-req-spaced-eq` 触及 30 万单题预算未收尾，P2P 5,407/5,407 无破坏）；`click` 3/4（`click-show-envvar` F2P 7/9、P2P 667/667）。
+- **Review（8 题，真实缺陷引入 PR + 后续真实 Bug Fix 作为 Ground Truth）**：`review-packaging-exc-msg`（TP 2/5，命中 GT）、`review-packaging-spec-iter`（TP 3/4，命中 GT）、`review-click-deprecated-label`（TP 1/1，发现有效缺陷但未中 GT）；其余 5 题未中 GT（其中 3 题因思考模型收尾截断为 0 findings，1 题 686 行大 diff 产生 8 条 FP）。
+- **环境说明**：仅在本地 `.venv` 安装 `pytest 9.2.0` 供被测开源仓库运行其自有测试套件，CodeHarness 运行时本身保持纯 Python 标准库零依赖。
+
+---
+
+## 轻量 Docker 沙箱与全链路耗时/轮次观测｜2026-11-27
+
+```text
+任务：新增可选 Docker 容器沙箱执行器（--sandbox docker）及全链路 turn / duration_ms 观测埋点；负责人：Antigravity
+基线：d05b3af3006834adc6ebd881071f18a1936aad88；工作区：D:\Code\python\CodeHarness；分支：main
+范围：codeharness/sandbox.py、codeharness/tools.py、codeharness/runtime.py、codeharness/cli.py、tests/test_sandbox.py、tests/test_runtime.py、README.md、README.en.md、HANDOFF.md（公共接口向后兼容：register_workspace_tools/Agent 新增可选 executor 参数；CLI 新增 --sandbox/--sandbox-image；事件新增可选 turn/attempt/duration_ms 字段，trace_timeline 纳入 usage）
+交付：未提交工作区差异（保留既有本地 .gitignore 改动）；状态：待集成
+验证：
+- 定向与核心回归：`python -B -m unittest tests.test_sandbox tests.test_runtime tests.test_transport_cli tests.test_interactive -v`（修正 model_truncated 断言后通过）
+- 全量离线回归：`python -B scripts/regress.py --tag sandbox-trace` -> 165 项单元测试 163 passed、2 skipped（符号链接权限与默认关闭的规模测试），夹具 full 12/12 + multi 3/3 + large 4/4（19/19），demo delegate/no_delegate 均为 verified（8/5 次请求）。报告：.codeharness/regress/sandbox-trace-20261127-041710/summary.json
+未验证或阻塞：
+- 本机 Docker Desktop daemon 未启动，尚未在真实 Docker 引擎中执行容器冒烟（已通过全部 Docker CLI 参数组装、环境变量隔离、POSIX 路径映射、超时 docker rm -f 清理及缺 docker 报错的契约测试）
+- test_symlink_cannot_escape_workspace 因本机权限跳过；未执行 git commit / push
+下一步：待用户确认后提交并推送（或在启动 Docker Desktop 后用 `--sandbox docker` 做一次真实容器冒烟验证）
+```
+
+---
+
 ## 交互开发、扩展生态与三层记忆演进｜2026-11-26 v1～v3
 
 ```text

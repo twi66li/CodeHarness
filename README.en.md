@@ -68,7 +68,7 @@ python -m codeharness trace SESSION_ID --workspace D:/your/repo --json
 python -m codeharness trace SESSION_ID --workspace D:/your/repo --timeline
 ```
 
-`--timeline` shows model requests, tools, compaction, delegation, verification and the result in event order. It also works with `--json`. This excerpt from a `multi` order task is in UTC, with fractional seconds and call IDs omitted. The agent ran out of budget before running workspace tests. External independent acceptance passed.
+`--timeline` shows model requests (`turn`/`attempt`), token usage and latency (`duration_ms`), tools, compaction, delegation, verification and the result in event order. It also works with `--json`. This excerpt from a `multi` order task is in UTC, with fractional seconds and call IDs omitted. The agent ran out of budget before running workspace tests. External independent acceptance passed.
 
 ```text
 15:23:33  model_request  model=deepseek-v4.1-flash max_tokens=4096
@@ -107,7 +107,7 @@ For Anthropic Messages, set `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` and pass `
 `verified` only means the last test run in the current workspace passed and file contents are unchanged since; a later failing or incomplete test run invalidates it. It does not replace independent acceptance.
 Token budgets are estimated before a request and corrected from `usage` afterwards. Only failed attempts that may have produced output (5xx, timeouts, length truncation) conservatively reserve the estimated input plus the output cap and are marked `estimated`; failures that clearly produced nothing (429, auth denial) do not consume output budget but still count towards the shared request limit. This is not a provider-side billing cap.
 Each model attempt and test run uses the task's remaining time, capped at 60 seconds each; Git queries are capped at 15 seconds. Timeouts are checked at call boundaries and cannot guarantee immediate termination of every host process.
-Tests run on the local machine; path checks, permissions and Git worktrees are not an OS sandbox.
+By default tests and `bash` run on the local host (path checks, permissions and Git worktrees are not an OS sandbox). For container isolation, pass `--sandbox docker` (optionally `--sandbox-image python:3.12-slim`) to `run`, `resume` or `chat`, which runs `run_tests` and `bash` in an ephemeral container with `--network none`, read-only rootfs, memory/CPU/PID limits and only the workspace mounted, removing the container on timeout via `docker rm -f`.
 Extensions are trusted local Python code with host privileges; read-only workers never load custom extensions.
 
 A model adapter implements `complete(messages, tools, max_tokens, *, timeout=None) -> Reply`, where `timeout` caps the remaining call time. The Chat Completions adapter keeps a string `reasoning_content` returned by the peer for later calls; provider compatibility must be confirmed by real integration. Session traces may contain private code, requirements or model output — never publish the whole database.
@@ -184,7 +184,7 @@ Benchmark pairs run on one model. Quota exhaustion preserves the tokens already 
 
 | Item | Result | Notes |
 | --- | --- | --- |
-| Unit and contract tests | 152/154 passed (2 skipped) | Symlink permissions and the opt-in scale test account for the local skips |
+| Unit and contract tests | 163/165 passed (2 skipped) | Symlink permissions and the opt-in scale test account for the local skips |
 | Reference fixture acceptance | 19/19 passed | `full` 12, `multi` 3, `large` 4. Every initial version fails its assertions and every reference fix passes (0 model calls) |
 | `glm-5.3` (`core`, `low`, 4096) | 4/5 (original prompt); `invoice` 1/1 after clarification | 33 requests, 65,570 tokens, 65.82 s, 0 model errors; acceptance exposed a negative-rounding difference under the original prompt |
 | `glm-5.3` (`multi`, `low`, 4096) | 3/3 passed | All three 11-file backend tasks fixed across exactly 3 modules; 22 requests, 62,579 tokens, 53.41 s, 0 model errors; `write_file` misuse errors dropped from 3 to 0 |
