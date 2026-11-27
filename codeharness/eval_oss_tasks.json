@@ -1,0 +1,201 @@
+{
+  "version": 1,
+  "description": "Real open-source GitHub Issue/PR benchmark (12 Fix + 8 Review) from pluggy, packaging, and click.",
+  "repos": {
+    "pluggy": "https://github.com/pytest-dev/pluggy.git",
+    "packaging": "https://github.com/pypa/packaging.git",
+    "click": "https://github.com/pallets/click.git"
+  },
+  "fix_tasks": [
+    {
+      "id": "pluggy-declined-ep",
+      "repo": "pluggy",
+      "fix_commit": "4d6b10d28b7af1b0a64e19cd2a709d519f2e06f4",
+      "title": "Fix declined entry point distribution tracking",
+      "problem_statement": "In `PluginManager.load_setuptools_entrypoints`, when `self.register(plugin, name=ep.name)` returns `None` (for example because registration was declined/ignored), the method still records `self._name2dist[ep.name] = dist` and increments `count`. Also if `register()` returns a canonical plugin name, `_name2dist` should be keyed by the returned plugin name rather than assuming `ep.name`. Fix `load_setuptools_entrypoints` so declined registrations are neither tracked in `_name2dist` nor counted in the returned plugin count."
+    },
+    {
+      "id": "pluggy-unregister-exc",
+      "repo": "pluggy",
+      "fix_commit": "8051a4dd7612aaf91944d1e16f8b644da3372184",
+      "title": "Raise TypeError/ValueError from unregister() instead of assert (#762)",
+      "problem_statement": "`PluginManager.unregister(plugin=None, name=None)` uses `assert` to check that at least one of `name` or `plugin` is provided and that the given `plugin` is registered. Under `python -O`, `assert` statements are stripped, causing `unregister()` with no arguments to return `None` and `unregister(unregistered_plugin)` to return the plugin instead of raising an error. Replace these assertions with explicit runtime checks: raise `TypeError` when neither `name` nor `plugin` is specified, and raise `ValueError` when `plugin` is given without `name` and is not registered."
+    },
+    {
+      "id": "pluggy-unregister-disagree",
+      "repo": "pluggy",
+      "fix_commit": "ccae6b9e72dc24a3dab37174d67a28f3396536f3",
+      "title": "Raise ValueError when unregister's plugin and name disagree",
+      "problem_statement": "The docstring of `PluginManager.unregister(plugin=None, name=None)` states that if both `plugin` and `name` are specified, they must agree. Currently, `unregister()` looks up hook callers by `plugin` but removes the registry entry by `name`, so passing a `plugin` and `name` that refer to different plugins corrupts the registry by mutating both plugins. Validate both directions before mutating any state and raise `ValueError` when `plugin` and `name` disagree."
+    },
+    {
+      "id": "pluggy-ep-truthiness",
+      "repo": "pluggy",
+      "fix_commit": "e108fa4490564b9f252fe7a8a4d1969f6f996641",
+      "title": "Skip registered entrypoint plugins without checking truthiness",
+      "problem_statement": "In `PluginManager.load_setuptools_entrypoints`, checking whether an entry point is already registered uses `or self.get_plugin(ep.name)`. If a registered plugin object is falsy (e.g., implements `__bool__` returning `False` or `__len__` returning `0`), `self.get_plugin(ep.name)` evaluates to falsy and the entry point is loaded and registered again, causing an error or duplicate load. Check plugin existence without evaluating the plugin's truthiness (e.g., `has_plugin`)."
+    },
+    {
+      "id": "pluggy-subset-specname",
+      "repo": "pluggy",
+      "fix_commit": "3d5417a4eff449e17e5bb3e1545b63cbf0e0c768",
+      "title": "Fix subset_hook_caller getting confused by specname",
+      "problem_statement": "`PluginManager.subset_hook_caller(name, remove_plugins)` currently filters `remove_plugins` using `hasattr(plug, name)`. However, when a plugin defines a hook implementation using `@hookimpl(specname=...)`, its attribute name on the plugin does not match the hook `name`, so `subset_hook_caller` fails to exclude that plugin. Fix `subset_hook_caller` so plugins in `remove_plugins` are properly matched against the hook's registered hookimpls regardless of `specname`."
+    },
+    {
+      "id": "packaging-req-spaced-eq",
+      "repo": "packaging",
+      "fix_commit": "5a7d3386d2777180a381eb947f21293124ce8df5",
+      "title": "Parse === followed by a spaced specifier in Requirement (#1500/#1531)",
+      "problem_statement": "Parsing a requirement that contains an arbitrary equality specifier (`===`) followed by a comma and a spaced specifier (such as `foo === 1.0, != 2.0`) fails in `packaging._parser` because `_try_parse_specifier_set` skips any specifier list containing `===`, falling back to the token loop where the `===` token consumes too much. Fix requirement specifier parsing so `===` followed by additional comma-separated specifiers parses cleanly into a `SpecifierSet`."
+    },
+    {
+      "id": "packaging-depgroup-self",
+      "repo": "packaging",
+      "fix_commit": "8efde605cc2666f4ab75e028b578b395ba288401",
+      "title": "Report self-inclusion for unnormalized spellings in dependency-groups (#1519)",
+      "problem_statement": "In `packaging.dependency_groups.DependencyGroupResolver._validate`, the included group name is normalized before checking for cycles against the include stack, but the raw unnormalized `item.include_group` is passed to `CyclicDependencyGroup`. Because `CyclicDependencyGroup` checks `include_group == group` (where `group` is already normalized), a self-include using an unnormalized spelling (like `'A'` inside group `'a'`, or `'A_B'` inside `'a.b'`) produces a misleading two-group cycle message instead of a self-inclusion message. Pass the normalized `include_group` when constructing `CyclicDependencyGroup`."
+    },
+    {
+      "id": "packaging-license-ascii",
+      "repo": "packaging",
+      "fix_commit": "8c37b0476f9406aa4578b853bbbcf7af1967d703",
+      "title": "Reject non-ASCII LicenseRefs before normalization (#1481)",
+      "problem_statement": "In `packaging.licenses.canonicalize_license_expression`, custom `LicenseRef-...` identifiers are lowercased and normalized before validation, which can allow non-ASCII characters (for instance Unicode characters whose lowercase form interacts unexpectedly) to slip past or raise an inconsistent error. Reject any `LicenseRef-` token that is not ASCII by raising `InvalidLicenseExpression` before normalizing it."
+    },
+    {
+      "id": "click-show-envvar",
+      "repo": "click",
+      "fix_commit": "c53d3732b98c764932e146c007146ad402acb229",
+      "title": "Fix show_envvar output for a sequence or an empty envvar",
+      "problem_statement": "In `click.Option`, when `show_envvar=True`: (1) `get_error_hint()` checks `self.envvar is not None` and formats `f\" (env var: '{self.envvar}')\"`, which breaks when `envvar` is a sequence of names (rendering a Python list repr) or an empty string/sequence (rendering an empty hint). Format each envvar name quoted and comma-separated, and omit the hint when `envvar` is empty. (2) In `get_help_extra()` / help display, also handle empty `envvar` (such as `\"\"` or `[]`) cleanly instead of only checking `is None`."
+    },
+    {
+      "id": "click-sentinel-copy",
+      "repo": "click",
+      "fix_commit": "f58ca3e81424a35626c8a475eb59ab95589008ce",
+      "title": "Fix copy, deepcopy and pickle of Sentinel members",
+      "problem_statement": "`click._utils.Sentinel` (and its singleton member `UNSET`) fails or loses singleton identity when copied with `copy.copy()`, `copy.deepcopy()`, or serialized/deserialized with `pickle.dumps()`/`pickle.loads()`. Implement `__copy__`, `__deepcopy__`, and `__reduce_ex__` on `Sentinel` so copying returns the exact same singleton member and unpickling resolves back to `getattr(Sentinel, name)`."
+    },
+    {
+      "id": "click-style-color",
+      "repo": "click",
+      "fix_commit": "07c909f23f0f83b5ca137c167b9a134d66201f67",
+      "title": "Validate style() color arguments and fix explicit black/0 color",
+      "problem_statement": "In `click.termui._interpret_color` (used by `click.style()`), color validation has several bugs: (1) `bool` values (`True`/`False`) pass `isinstance(color, int)` and silently render as palette indices 1 and 0; (2) out-of-range integer palette indices (<0 or >255) and invalid RGB tuples (wrong length, bool elements, or values outside 0..255) are not rejected with `TypeError`/`ValueError`; (3) passing explicit color `0` (palette index 0 / black) in `style(fg=0)` or `style(bg=0)` is dropped if truthiness (`if fg:`) is checked instead of `is not None`. Fix color validation and handling of explicit `0` color values in `termui.py`."
+    },
+    {
+      "id": "click-strip-ansi-prompt",
+      "repo": "click",
+      "fix_commit": "93ba0075f4881b858b61f89a753c7c10e330027e",
+      "title": "Strip ANSI from confirm() and prompt() when stream does not support them (#3572)",
+      "problem_statement": "When `click.prompt()` or `click.confirm()` passes a styled prompt string (containing ANSI escape codes) to the underlying prompt function (`input` via `_readline_prompt`), ANSI escape sequences are emitted raw even when the destination stream (`stdout` or `stderr`) does not support ANSI colors (e.g., redirected/non-TTY streams or `color=False` / `NO_COLOR`). Update prompt handling in `src/click/termui.py` so ANSI codes are stripped when the destination stream does not support ANSI."
+    }
+  ],
+  "review_tasks": [
+    {
+      "id": "review-packaging-exc-msg",
+      "repo": "packaging",
+      "pr_commit": "0efe21aa398df645c259ee31e54a8a4400b1fc6b",
+      "fix_commit": "f91ea7931fa551eb498ca2cdf5644dbbf20bcbc6",
+      "title": "feat: expose syntax error details on InvalidRequirement and InvalidMarker (#1547)",
+      "ground_truth": [
+        {
+          "file": "src/packaging/markers.py",
+          "issue": "In `InvalidMarker.__init__` and `InvalidRequirement.__init__`, calling `str(self)` eagerly inside `__init__` breaks subclasses or callers passing arguments that cannot be formatted during initialization (and adds unnecessary eager formatting work); `self.message` should be computed lazily (e.g. via `cached_property`) when `message is None`."
+        }
+      ]
+    },
+    {
+      "id": "review-packaging-spec-iter",
+      "repo": "packaging",
+      "pr_commit": "2b06f90cbe2ffbde64ea23ca36c96c35e2aca05a",
+      "fix_commit": "9afc187996400b417b7109b1b3452d7fdcfe7696",
+      "title": "Allow creating a SpecifierSet from a list of specifiers (#777)",
+      "ground_truth": [
+        {
+          "file": "src/packaging/specifiers.py",
+          "issue": "When `SpecifierSet` receives a non-string iterable, it assigns `frozenset(specifiers)` directly without validating or parsing elements, so passing a list of plain strings (e.g. `SpecifierSet(['>=1.0'])`) or invalid element types silently stores raw strings and later breaks `SpecifierSet` operations instead of parsing `str` elements into `Specifier` objects or raising `TypeError`."
+        }
+      ]
+    },
+    {
+      "id": "review-packaging-marker-depth",
+      "repo": "packaging",
+      "pr_commit": "31435f490e0b82cb952997d1f4b941605e14e39b",
+      "fix_commit": "4d7875f85e64aa9d56fe69af5eb017e796659fd1",
+      "title": "Rework the parser with context-sensitive tokenisation",
+      "ground_truth": [
+        {
+          "file": "packaging/_parser.py",
+          "issue": "Recursive parsing of parenthesized marker groups (`_parse_marker` / `_parse_marker_atom`) has no nesting depth limit, so deeply nested parentheses exhaust Python's recursion limit and leak an unhandled `RecursionError` instead of raising a parser/syntax error (`InvalidMarker`)."
+        }
+      ]
+    },
+    {
+      "id": "review-click-deprecated-label",
+      "repo": "click",
+      "pr_commit": "c040135a74180d65c97c66614f234ea89c337ceb",
+      "fix_commit": "82f377c547e1867d073f02bb8f476214d07e245b",
+      "title": "Deduplicate deprecated label translation",
+      "ground_truth": [
+        {
+          "file": "src/click/core.py",
+          "issue": "When appending the deprecated label to `help` (when `help` is empty vs non-empty), the refactored formatting introduces leading/extra whitespace or misformats the deprecated label when `help` is empty or `None`."
+        }
+      ]
+    },
+    {
+      "id": "review-click-double-bracket",
+      "repo": "click",
+      "pr_commit": "ddede2147c9370ab8275f81db4826b6895d2e7dc",
+      "fix_commit": "762c97eef7c1b3779678992f26a553a2a8c80793",
+      "title": "Parameter typing improvements (#2805)",
+      "ground_truth": [
+        {
+          "file": "src/click/core.py",
+          "issue": "In `Argument.make_metavar`, when `not self.required` and `var` is already wrapped in square brackets by types like `Choice` or `DateTime` (e.g. `[a|b]`), wrapping it again with `f'[{var}]'` produces double-bracketed output like `[[a|b]]`."
+        }
+      ]
+    },
+    {
+      "id": "review-click-short-help",
+      "repo": "click",
+      "pr_commit": "d48b59be391f9f9bfb41dd62db07e46519d08bfe",
+      "fix_commit": "f67c2bb6c2f055c1c7a57cd46c3697fc26a7742e",
+      "title": "Fix make_default_short_help max_length and refactor",
+      "ground_truth": [
+        {
+          "file": "src/click/utils.py",
+          "issue": "In `_make_default_short_help`, edge cases in abbreviation/period detection, `\\b` marker handling, or truncation length calculation cause incorrect short-help truncation (e.g. treating abbreviations like 'e.g.'/'vs.' as sentence endings, or miscomputing remaining length / empty text after `\\b`)."
+        }
+      ]
+    },
+    {
+      "id": "review-click-version-pkg",
+      "repo": "click",
+      "pr_commit": "81ff0aea6c814c7fad7ed4e7c76098a97d6a0fbe",
+      "fix_commit": "bec59289d8cf9b9b4010642b2fee483e5f8eeefc",
+      "title": "Refactor version_option",
+      "ground_truth": [
+        {
+          "file": "src/click/decorators.py",
+          "issue": "`version_option` assumes the detected top-level module name (from frame inspection) matches the installed distribution name passed to `importlib.metadata.version()`, failing whenever the import/module name differs from the distribution package name (e.g. `PIL` vs `Pillow`, or packages with different top-level module names)."
+        }
+      ]
+    },
+    {
+      "id": "review-pluggy-register-none",
+      "repo": "pluggy",
+      "pr_commit": "d74375236bb4285fdc4c9c5bd2e653a679a950ba",
+      "fix_commit": "2e3774328e26287780f0ae849e3cb5db2ba4e78b",
+      "title": "Reject PluginManager.register(None)",
+      "ground_truth": [
+        {
+          "file": "src/pluggy/_manager.py",
+          "issue": "Changing `PluginManager.register(None)` to raise `TypeError` is a breaking backwards-compatibility regression for downstream callers that pass `None` expecting a no-op (`return None`)."
+        }
+      ]
+    }
+  ]
+}
